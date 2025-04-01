@@ -12,6 +12,19 @@ import CoreLocation
 struct RoadSegment {
     let start: CLLocationCoordinate2D
     let end: CLLocationCoordinate2D
+    
+    // Информация о направлении дороги
+    let isOneway: Bool
+    let forwardDirection: Bool  // true если направление от start к end является разрешенным
+    
+    // Инициализатор с дефолтными значениями для обратной совместимости
+    init(start: CLLocationCoordinate2D, end: CLLocationCoordinate2D, 
+         isOneway: Bool = false, forwardDirection: Bool = true) {
+        self.start = start
+        self.end = end
+        self.isOneway = isOneway
+        self.forwardDirection = forwardDirection
+    }
 }
 
 // Класс для конвертации координат в сегменты
@@ -144,9 +157,124 @@ class CoordinateConverter {
         
         return pointLoc.distance(from: nearestPoint)
     }
+    
+    // Метод для создания дорожных сегментов из GeoJSON данных
+    func convertFromGeoJSON(feature: [String: Any]) -> [RoadSegment] {
+        guard let geometry = feature["geometry"] as? [String: Any],
+              let type = geometry["type"] as? String,
+              type == "LineString",
+              let coordinates = geometry["coordinates"] as? [[Double]] else {
+            return []
+        }
+        
+        // Извлечение свойств дороги
+        let properties = feature["properties"] as? [String: Any]
+        let isOneway = extractOnewayStatus(from: properties)
+        let forwardDirection = extractDirection(from: properties)
+        
+        var roadSegments: [RoadSegment] = []
+        
+        // Создаем сегменты из координат
+        for i in 0..<(coordinates.count - 1) {
+            guard coordinates[i].count >= 2, coordinates[i+1].count >= 2 else { continue }
+            
+            // GeoJSON использует формат [долгота, широта], нужно конвертировать
+            let startCoord = CLLocationCoordinate2D(
+                latitude: coordinates[i][1],
+                longitude: coordinates[i][0]
+            )
+            
+            let endCoord = CLLocationCoordinate2D(
+                latitude: coordinates[i+1][1],
+                longitude: coordinates[i+1][0]
+            )
+            
+            let segment = RoadSegment(
+                start: startCoord,
+                end: endCoord,
+                isOneway: isOneway,
+                forwardDirection: forwardDirection
+            )
+            
+            roadSegments.append(segment)
+        }
+        
+        return roadSegments
+    }
+    
+    // Метод для считывания статуса односторонней дороги
+    private func extractOnewayStatus(from properties: [String: Any]?) -> Bool {
+        guard let properties = properties else { return false }
+        
+        // Разные форматы GeoJSON могут использовать разные ключи
+        if let oneway = properties["oneway"] as? Bool {
+            return oneway
+        }
+        
+        if let onewayStr = properties["oneway"] as? String,
+           onewayStr.lowercased() == "yes" || onewayStr == "1" || onewayStr.lowercased() == "true" {
+            return true
+        }
+        
+        // OSM использует тэг для одностороннего движения
+        if let highway = properties["highway"] as? String,
+           let oneWay = properties["oneway"] as? String, 
+           oneWay.lowercased() == "yes" {
+            return true
+        }
+        
+        return false
+    }
+    
+    // Метод для считывания направления дороги
+    private func extractDirection(from properties: [String: Any]?) -> Bool {
+        guard let properties = properties else { return true }
+        
+        // По умолчанию направление - от начала к концу линии
+        var forwardDirection = true
+        
+        // Проверяем различные форматы указания направления
+        if let direction = properties["direction"] as? String {
+            if direction.lowercased() == "backward" || direction == "-1" || direction.lowercased() == "reverse" {
+                forwardDirection = false
+            }
+        }
+        
+        // Проверяем OSM-специфичный тэг
+        if let oneWay = properties["oneway"] as? String, oneWay == "-1" {
+            forwardDirection = false
+        }
+        
+        return forwardDirection
+    }
+    
+    // Загрузка дорожных сегментов из GeoJSON файла
+    func loadRoadSegmentsFromGeoJSON(fileURL: URL) -> [RoadSegment] {
+        var roadSegments: [RoadSegment] = []
+        
+        do {
+            let data = try Data(contentsOf: fileURL)
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let features = json["features"] as? [[String: Any]] else {
+                print("Ошибка чтения формата GeoJSON: неверная структура")
+                return []
+            }
+            
+            for feature in features {
+                let segments = convertFromGeoJSON(feature: feature)
+                roadSegments.append(contentsOf: segments)
+            }
+            
+            print("Загружено \(roadSegments.count) дорожных сегментов из GeoJSON")
+        } catch {
+            print("Ошибка чтения GeoJSON файла: \(error.localizedDescription)")
+        }
+        
+        return roadSegments
+    }
 }
 
-extension CLLocationCoordinate2D: @retroactive Equatable {
+extension CLLocationCoordinate2D: Equatable {
     public static func == (lhs: CLLocationCoordinate2D, rhs: CLLocationCoordinate2D) -> Bool {
         return lhs.latitude == rhs.latitude && lhs.longitude == rhs.longitude
     }
