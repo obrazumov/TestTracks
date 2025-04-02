@@ -146,7 +146,7 @@ struct MapViewRepresentable: UIViewRepresentable {
     func makeUIView(context: Context) -> MKMapView {
         let mapView = MKMapView()
         mapView.delegate = context.coordinator
-        
+        mapView.mapType = .satelliteFlyover
         // Настройка отображения карты
         mapView.showsCompass = true
         mapView.showsScale = true

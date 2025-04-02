@@ -17,7 +17,7 @@ enum TrackType: CaseIterable {
         case .road:
             return "export.geojson"
         case .route:
-            return "raw_track 2.nmea"
+            return "output_track 2.nmea"
         }
     }
 }
@@ -40,6 +40,8 @@ final class MapModel: ObservableObject {
     private let proximityDistance: Double = 200.0 // Увеличено с 100 до 200 метров
     // Шаг для проверки точек трека (проверяем каждую n-ю точку)
     private let trackPointCheckStride = 3
+    private var trackPoints: [TrackPoint] = []
+    private var originalTrack: Track? = nil
     
     func loadTracks() {
         // Устанавливаем флаг загрузки
@@ -62,21 +64,24 @@ final class MapModel: ObservableObject {
                     trackCoordinates = trackPoints.map({ $0.coordinate })
                     
                     if !trackCoordinates.isEmpty {
-                        let track = Track(
+                        // Создаем оригинальный трек
+                        self.originalTrack = Track(
                             name: fileURL.deletingPathExtension().lastPathComponent,
                             coordinates: trackCoordinates,
                             color: .red
                         )
-                        newTracks.append(track)
                         
-                        // Обновляем UI с треком, не дожидаясь загрузки дорог
+                        // Обновляем UI с оригинальным треком
                         DispatchQueue.main.async {
-                            self.tracks = [track]
+                            self.tracks = [self.originalTrack!]
                             // Устанавливаем область карты на трек
                             self.position = .region(MKCoordinateRegion(
-                                center: track.coordinates[0],
+                                center: trackCoordinates[0],
                                 span: MKCoordinateSpan(latitudeDelta: 0.1, longitudeDelta: 0.1)))
                         }
+                        
+                        // Сохраняем trackPoints для последующего использования
+                        self.trackPoints = trackPoints
                     }
                 }
             }
@@ -102,7 +107,7 @@ final class MapModel: ObservableObject {
                     print("BBox трека: расширенный = (\(bbox.expanded.minLat), \(bbox.expanded.maxLat), \(bbox.expanded.minLon), \(bbox.expanded.maxLon))")
                     
                     // Увеличиваем максимальное количество дорог
-                    let maxRoads = 15000 // Увеличено с 10000 до 15000 для отображения большего количества дорог
+                    let maxRoads = 150000 // Увеличено с 10000 до 15000 для отображения большего количества дорог
                     
                     self.updateProgress("Чтение GeoJSON файла с фильтрацией по области трека...")
                     
@@ -136,6 +141,11 @@ final class MapModel: ObservableObject {
                     NotificationCenter.default.removeObserver(progressObserver)
                     
                     print("Загружено всего \(allRoads.count) дорог из GeoJSON (ограничено до \(maxRoads))")
+                    print("Статистика дорог:")
+                    print("- Дороги с 1 точкой: \(allRoads.filter { $0.coordinates.count == 1 }.count)")
+                    print("- Дороги с 2 точками: \(allRoads.filter { $0.coordinates.count == 2 }.count)")
+                    print("- Дороги с 3+ точками: \(allRoads.filter { $0.coordinates.count > 2 }.count)")
+                    
                     self.updateProgress("Фильтрация дорог по области трека (\(allRoads.count) загружено)...")
                     
                     // Дополнительная фильтрация дорог по bbox
@@ -223,70 +233,25 @@ final class MapModel: ObservableObject {
                         if !trackCoordinates.isEmpty && !self.roadSegments.isEmpty {
                             self.updateProgress("Сопоставление трека с дорогами (\(self.roadSegments.count) сегментов)...")
                             
-                            // Прореживаем трек для ускорения сопоставления
-                            var simplifiedTrackPoints: [TrackPoint] = []
-                            let trackStrideValue = max(1, trackCoordinates.count / 1000)
+                            // Создаем скорректированный трек
+                            let correctedCoordinates = self.mapMatcher.matchTrackWithErrorCorrection(
+                                gpsTrack: self.trackPoints,
+                                roadSegments: self.roadSegments,
+                                maxDistance: 15.0,
+                                forceSnapToRoad: true,
+                                maxForceSnapDistance: 30.0
+                            )
                             
-                            if trackStrideValue > 1 {
-                                print("Прореживаем трек (было \(trackCoordinates.count) точек, шаг \(trackStrideValue))")
-                                for i in stride(from: 0, to: trackCoordinates.count, by: trackStrideValue) {
-                                    simplifiedTrackPoints.append(TrackPoint(coordinate: trackCoordinates[i], timestamp: Date()))
-                                }
-                            } else {
-                                simplifiedTrackPoints = trackCoordinates.map { TrackPoint(coordinate: $0, timestamp: Date()) }
-                            }
+                            let correctedTrack = Track(
+                                name: "\(fileURL.deletingPathExtension().lastPathComponent)_corrected",
+                                coordinates: correctedCoordinates,
+                                color: .green
+                            )
                             
-                            print("Использую \(simplifiedTrackPoints.count) точек трека для сопоставления")
-                            
-                            // Защита от зависания - выполняем сопоставление в фоновом потоке с таймаутом
-                            let semaphore = DispatchSemaphore(value: 0)
-                            var mapMatcherTrack: [CLLocationCoordinate2D] = []
-                            
-                            let matchingQueue = DispatchQueue(label: "com.app.mapmatching", qos: .userInitiated)
-                            matchingQueue.async {
-                                mapMatcherTrack = self.mapMatcher.matchTrackWithErrorCorrection(
-                                    gpsTrack: simplifiedTrackPoints, 
-                                    roadSegments: self.roadSegments,
-                                    maxDistance: 100.0
-                                )
-                                semaphore.signal()
-                            }
-                            
-                            // Ждем завершения сопоставления с таймаутом
-                            let timeout = DispatchTime.now() + .seconds(30)
-                            let result = semaphore.wait(timeout: timeout)
-                            
-                            if result == .timedOut {
-                                print("ПРЕДУПРЕЖДЕНИЕ: Сопоставление превысило лимит времени (30 сек)")
-                                self.updateProgress("Сопоставление остановлено по таймауту")
-                                
-                                // Возвращаем только исходный трек в случае таймаута
-                                DispatchQueue.main.async {
-                                    self.tracks = newTracks
-                                    self.isLoading = false
-                                }
-                            } else {
-                                print("Сопоставление успешно завершено, получено \(mapMatcherTrack.count) точек")
-                                
-                                if !mapMatcherTrack.isEmpty {
-                                    let validTrack = Track(
-                                        name: "validTrack",
-                                        coordinates: mapMatcherTrack,
-                                        color: .green
-                                    )
-                                    
-                                    // Обновляем UI с обработанным треком
-                                    DispatchQueue.main.async {
-                                        self.tracks = newTracks + [validTrack]
-                                    }
-                                } else {
-                                    print("ОШИБКА: Сопоставление не дало результатов")
-                                    self.updateProgress("Ошибка сопоставления")
-                                    
-                                    // Возвращаем только исходный трек в случае ошибки
-                                    DispatchQueue.main.async {
-                                        self.tracks = newTracks
-                                    }
+                            // Обновляем UI с обоими треками
+                            DispatchQueue.main.async {
+                                if let originalTrack = self.originalTrack {
+                                    self.tracks = [originalTrack, correctedTrack]
                                 }
                             }
                         }
@@ -414,23 +379,29 @@ final class MapModel: ObservableObject {
     
     // Новый метод для фильтрации дорог по bbox
     private func filterRoadsByBBox(roads: [Road], bbox: (minLat: Double, maxLat: Double, minLon: Double, maxLon: Double)) -> [Road] {
-        let startTime = Date()
+        print("\nФильтрация дорог по bbox:")
+        print("- Всего дорог до фильтрации: \(roads.count)")
+        print("- Bbox: \(bbox)")
         
-        // Фильтруем дороги - оставляем только те, у которых хотя бы одна точка находится в bbox
         let filteredRoads = roads.filter { road in
-            for coord in road.coordinates {
-                if coord.latitude >= bbox.minLat && coord.latitude <= bbox.maxLat &&
-                   coord.longitude >= bbox.minLon && coord.longitude <= bbox.maxLon {
-                    return true // Если хотя бы одна точка дороги попадает в bbox, включаем дорогу
-                }
+            // Проверяем, что хотя бы одна точка дороги находится в bbox
+            road.coordinates.contains { coord in
+                coord.latitude >= bbox.minLat && coord.latitude <= bbox.maxLat &&
+                coord.longitude >= bbox.minLon && coord.longitude <= bbox.maxLon
             }
-            return false // Ни одна точка не попадает в bbox
         }
         
-        let endTime = Date()
-        let elapsedTime = endTime.timeIntervalSince(startTime)
-        print("Фильтрация дорог по bbox заняла \(String(format: "%.2f", elapsedTime)) секунд")
-        print("Отфильтровано \(roads.count - filteredRoads.count) дорог, оставлено \(filteredRoads.count)")
+        print("- Дорог после фильтрации: \(filteredRoads.count)")
+        print("- Отфильтровано: \(roads.count - filteredRoads.count)")
+        
+        // Статистика по отфильтрованным дорогам
+        let filteredStats = filteredRoads.reduce(into: [Int: Int]()) { counts, road in
+            counts[road.coordinates.count, default: 0] += 1
+        }
+        print("\nСтатистика отфильтрованных дорог:")
+        for (pointCount, count) in filteredStats.sorted(by: { $0.key < $1.key }) {
+            print("- Дороги с \(pointCount) точками: \(count)")
+        }
         
         return filteredRoads
     }
