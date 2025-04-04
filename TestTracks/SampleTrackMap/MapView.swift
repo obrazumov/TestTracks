@@ -1,5 +1,36 @@
 import SwiftUI
 import MapKit
+import ObjectiveC
+
+// Ключи для Associated Objects
+private struct AssociatedKeys {
+    static var segmentType = "segmentType"
+    static var candidateColor = "candidateColor"
+}
+
+// Класс для отображения кандидатов на карте
+class TestCandidateAnnotation: NSObject, MKAnnotation {
+    let candidate: TestCandidat
+    var coordinate: CLLocationCoordinate2D {
+        candidate.trackPoint.coordinate
+    }
+    
+    init(candidate: TestCandidat) {
+        self.candidate = candidate
+        super.init()
+    }
+}
+
+// Класс для отображения сегмента дороги с цветом из TestCandidate
+class CandidatePolyline: MKPolyline {
+    var segmentType: SegmentType = .projection
+    var candidateColor: UIColor = .red
+    
+    enum SegmentType {
+        case roadSegment
+        case projection
+    }
+}
 
 struct MapView: View {
     @ObservedObject private var model: MapModel = .init()
@@ -12,12 +43,15 @@ struct MapView: View {
             MapViewRepresentable(
                 position: $model.position,
                 showAllRoads: $showAllRoads,
+                candidates: $model.candidates,
                 model: model,
                 tracks: filteredTracks
             )
             .edgesIgnoringSafeArea(.all)
             .onAppear {
-                model.loadTracks()
+                Task {
+                    await model.loadTracks()
+                }
             }
             
             // Улучшенный индикатор загрузки с процентами
@@ -116,6 +150,12 @@ struct MapView: View {
                             .foregroundColor(.white)
                             .padding(.top, 2)
                     }
+                    Button("Next") {
+                        Task {
+                            await model.next()
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
                 }
                 .padding()
                 .background(Color.black.opacity(0.6))
@@ -140,6 +180,7 @@ struct MapView: View {
 struct MapViewRepresentable: UIViewRepresentable {
     @Binding var position: MapCameraPosition
     @Binding var showAllRoads: Bool
+    @Binding var candidates: [TestCandidat]
     var model: MapModel
     var tracks: [Track]
     
@@ -157,13 +198,15 @@ struct MapViewRepresentable: UIViewRepresentable {
     
     func updateUIView(_ mapView: MKMapView, context: Context) {
         // Обновление положения карты при изменении положения
-        if let region = position.region {
+        if let region = position.region,
+           mapView.overlays.filter({ $0 is TrackPolyline }).isEmpty {
             mapView.setRegion(region, animated: true)
         }
         
         // Обновляем треки
         updateTracks(mapView)
         
+        updateCandidates(mapView)
         // Обновляем дороги через оверлеи
         updateRoadsOverlays(mapView)
     }
@@ -181,38 +224,85 @@ struct MapViewRepresentable: UIViewRepresentable {
             mapView.addOverlay(polyline)
         }
     }
+    private func updateCandidates(_ mapView: MKMapView) {
+        // Удаляем все предыдущие аннотации кандидатов и оверлеи сегментов
+        let existingAnnotations = mapView.annotations.filter { $0 is TestCandidateAnnotation }
+        let existingPolylines = mapView.overlays.filter { 
+            $0 is CandidatePolyline
+        }
+        mapView.removeAnnotations(existingAnnotations)
+        mapView.removeOverlays(existingPolylines)
+        
+        // Добавляем новые аннотации и оверлеи для каждого кандидата
+        for candidate in candidates {
+            // Добавляем аннотацию кандидата
+            let annotation = TestCandidateAnnotation(candidate: candidate)
+            mapView.addAnnotation(annotation)
+            
+            // Добавляем оверлей сегмента дороги
+            for segment in candidate.candidates {
+                // Создаем полилинию для сегмента дороги
+                let segmentPolyline = createCandidatePolyline(
+                    coordinates: [segment.start, segment.end],
+                    type: .roadSegment,
+                    color: candidate.color
+                )
+                mapView.addOverlay(segmentPolyline, level: .aboveRoads)
+                
+                // Рисуем линию от точки до проекции
+                let projectionPolyline = createCandidatePolyline(
+                    coordinates: [candidate.trackPoint.coordinate, candidate.newPoint],
+                    type: .projection,
+                    color: candidate.color
+                )
+                mapView.addOverlay(projectionPolyline, level: .aboveRoads)
+            }
+        }
+        mapView.setNeedsDisplay()
+    }
+    
+    // Вспомогательный метод для создания CandidatePolyline
+    private func createCandidatePolyline(coordinates: [CLLocationCoordinate2D], type: CandidatePolyline.SegmentType, color: UIColor) -> MKPolyline {
+        let polyline = CandidatePolyline(coordinates: coordinates, count: coordinates.count)
+        polyline.candidateColor = color
+        polyline.segmentType = type
+        return polyline
+    }
     
     private func updateRoadsOverlays(_ mapView: MKMapView) {
         // Удаляем все предыдущие оверлеи дорог
         let existingRoadOverlays = mapView.overlays.filter { $0 is RoadsOverlay }
+        guard existingRoadOverlays.isEmpty else { return }
         if !existingRoadOverlays.isEmpty {
+            return
             print("Удаляем \(existingRoadOverlays.count) существующих оверлеев дорог")
             mapView.removeOverlays(existingRoadOverlays)
-        }
-        
-        // Добавляем новый оверлей дорог в зависимости от showAllRoads
-        if showAllRoads, let overlay = model.roadsOverlay {
-            print("Добавляем оверлей всех дорог: \((overlay as! RoadsOverlay).roads.count) дорог")
-            
-            // Добавляем оверлей в начало списка, чтобы он был под треками
-            mapView.insertOverlay(overlay, at: 0)
-            
-            // Заставляем карту перерисоваться
-            mapView.setNeedsDisplay()
-            
-            print("Текущие оверлеи на карте после добавления: \(mapView.overlays.count)")
-        } else if let overlay = model.usedRoadsOverlay {
-            print("Добавляем оверлей используемых дорог: \((overlay as! RoadsOverlay).roads.filter { $0.isUsedByTrack }.count) дорог")
-            
-            // Добавляем оверлей в начало списка, чтобы он был под треками
-            mapView.insertOverlay(overlay, at: 0)
-            
-            // Заставляем карту перерисоваться
-            mapView.setNeedsDisplay()
-            
-            print("Текущие оверлеи на карте после добавления: \(mapView.overlays.count)")
         } else {
-            print("ПРЕДУПРЕЖДЕНИЕ: Нет доступных оверлеев дорог для отображения")
+            
+            // Добавляем новый оверлей дорог в зависимости от showAllRoads
+            if showAllRoads, let overlay = model.roadsOverlay {
+                print("Добавляем оверлей всех дорог: \((overlay as! RoadsOverlay).roads.count) дорог")
+                
+                // Добавляем оверлей в начало списка, чтобы он был под треками
+                mapView.insertOverlay(overlay, at: 0)
+                
+                // Заставляем карту перерисоваться
+                mapView.setNeedsDisplay()
+                
+                print("Текущие оверлеи на карте после добавления: \(mapView.overlays.count)")
+            } else if let overlay = model.usedRoadsOverlay {
+                print("Добавляем оверлей используемых дорог: \((overlay as! RoadsOverlay).roads.filter { $0.isUsedByTrack }.count) дорог")
+                
+                // Добавляем оверлей в начало списка, чтобы он был под треками
+                mapView.insertOverlay(overlay, at: 0)
+                
+                // Заставляем карту перерисоваться
+                mapView.setNeedsDisplay()
+                
+                print("Текущие оверлеи на карте после добавления: \(mapView.overlays.count)")
+            } else {
+                print("ПРЕДУПРЕЖДЕНИЕ: Нет доступных оверлеев дорог для отображения")
+            }
         }
     }
     
@@ -245,10 +335,21 @@ struct MapViewRepresentable: UIViewRepresentable {
                 return renderer
             } else if let roadsOverlay = overlay as? RoadsOverlay {
                 return RoadsOverlayRenderer(overlay: roadsOverlay)
+            } else if let candidatesOverlay = overlay as? CandidatePolyline {
+                let renderer = MKPolylineRenderer(overlay: overlay)
+                renderer.strokeColor = candidatesOverlay.candidateColor
+                switch candidatesOverlay.segmentType {
+                case .projection:
+                    renderer.lineWidth = 1.5
+                    renderer.lineDashPattern = [2, 2]
+                case .roadSegment:
+                    renderer.lineWidth = 3
+                }
+                return renderer
+            } else {
+                // Для неизвестных типов используем стандартный рендерер
+                return MKOverlayRenderer(overlay: overlay)
             }
-            
-            // Для неизвестных типов используем стандартный рендерер
-            return MKOverlayRenderer(overlay: overlay)
         }
     }
 }

@@ -17,18 +17,19 @@ enum TrackType: CaseIterable {
         case .road:
             return "export.geojson"
         case .route:
-            return "output_track 2.nmea"
+            return "output_track 2.nmea"//"raw_track 3.nmea"
         }
     }
 }
 
 final class MapModel: ObservableObject {
     let coordinateConverter: CoordinateConverter = .init()
-    let mapMatcher: MapMatcher = .init()
+    let mapMatcher: MapMatching = MapMatcherFactory.createMapMatcher(type: .custom(MyMapMatcher()))
     @Published var tracks: [Track] = []
     @Published var roads: [Road] = []
     @Published var roadsOverlay: RoadsOverlay? = nil
     @Published var usedRoadsOverlay: RoadsOverlay? = nil
+    @Published var candidates: [TestCandidat] = []
     @Published var isLoading: Bool = false
     @Published var loadingProgress: String = "Начало загрузки..."
     @Published var position: MapCameraPosition = .region(MKCoordinateRegion(
@@ -42,241 +43,239 @@ final class MapModel: ObservableObject {
     private let trackPointCheckStride = 3
     private var trackPoints: [TrackPoint] = []
     private var originalTrack: Track? = nil
-    
-    func loadTracks() {
+    private var currentIndex = 0
+    func loadTracks() async {
         // Устанавливаем флаг загрузки
-        isLoading = true
-        loadingProgress = "Начало загрузки..."
+        await MainActor.run {
+            isLoading = true
+            loadingProgress = "Начало загрузки..."
+        }
         
-        // Используем фоновую очередь для загрузки и обработки данных
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self = self else { return }
-            var newTracks: [Track] = []
-            var trackCoordinates: [CLLocationCoordinate2D] = []
-            
-            // ЭТАП 1: Загрузка трека
-            self.updateProgress("Загрузка GPS трека...")
-            if let filePath = Bundle.main.path(forResource: TrackType.route.fileName, ofType: nil) {
-                let fileURL = URL(fileURLWithPath: filePath)
-                if fileURL.pathExtension.lowercased() == "nmea" {
-                    let data = TrackParser.parseNMEAFile(fileURL)
-                    let trackPoints = data.map({ TrackPoint(coordinate: $0.coordinate, timestamp: $0.timestamp)})
-                    trackCoordinates = trackPoints.map({ $0.coordinate })
-                    
-                    if !trackCoordinates.isEmpty {
-                        // Создаем оригинальный трек
-                        self.originalTrack = Track(
-                            name: fileURL.deletingPathExtension().lastPathComponent,
-                            coordinates: trackCoordinates,
-                            color: .red
-                        )
-                        
-                        // Обновляем UI с оригинальным треком
-                        DispatchQueue.main.async {
-                            self.tracks = [self.originalTrack!]
-                            // Устанавливаем область карты на трек
-                            self.position = .region(MKCoordinateRegion(
-                                center: trackCoordinates[0],
-                                span: MKCoordinateSpan(latitudeDelta: 0.1, longitudeDelta: 0.1)))
-                        }
-                        
-                        // Сохраняем trackPoints для последующего использования
-                        self.trackPoints = trackPoints
+        // ЭТАП 1: Загрузка трека
+        let trackCoordinates = await loadCoordinates()
+        
+        // ЭТАП 2: Загрузка дорог - с существенными оптимизациями
+        await loadRoads(trackCoordinates: trackCoordinates)
+        // Завершаем загрузку
+        await updateProgress("Загрузка завершена")
+        await MainActor.run {
+            self.isLoading = false
+        }
+    }
+    func next() async {
+        guard currentIndex < trackPoints.count - 1 else { return }
+        currentIndex += 1
+        guard let candidate = await mapMatcher.matchTrackCandidat(gpsTrack: trackPoints, roadSegments: roadSegments, index: currentIndex) else { return }
+        await MainActor.run {
+            candidates.append(candidate)
+        }
+    }
+    
+}
+
+private extension MapModel {
+    func loadCoordinates() async -> [CLLocationCoordinate2D] {
+        await updateProgress("Загрузка GPS трека...")
+        var trackCoordinates: [CLLocationCoordinate2D] = []
+        
+        if let filePath = Bundle.main.path(forResource: TrackType.route.fileName, ofType: nil) {
+            let fileURL = URL(fileURLWithPath: filePath)
+            if fileURL.pathExtension.lowercased() == "nmea" {
+                let data = TrackParser.parseNMEAFile(fileURL)
+                let trackPoints = data.map({ TrackPoint(coordinate: $0.coordinate, timestamp: $0.timestamp)})
+                trackCoordinates = trackPoints.map({ $0.coordinate })
+                
+                if !trackCoordinates.isEmpty {
+                    // Создаем оригинальный трек
+                    self.originalTrack = Track(
+                        name: fileURL.deletingPathExtension().lastPathComponent,
+                        coordinates: trackCoordinates,
+                        color: .red
+                    )
+                    let center = trackCoordinates[0]
+                    // Обновляем UI с оригинальным треком
+                    await MainActor.run {
+                        self.tracks = [self.originalTrack!]
+                        // Устанавливаем область карты на трек
+                        self.position = .region(MKCoordinateRegion(
+                            center: center,
+                            span: MKCoordinateSpan(latitudeDelta: 0.1, longitudeDelta: 0.1)))
                     }
+                    
+                    // Сохраняем trackPoints для последующего использования
+                    self.trackPoints = trackPoints
                 }
             }
-            
-            // ЭТАП 2: Загрузка дорог - с существенными оптимизациями
-            self.updateProgress("Загрузка дорог из GeoJSON...")
-            if let filePath = Bundle.main.path(forResource: TrackType.road.fileName, ofType: nil) {
-                let fileURL = URL(fileURLWithPath: filePath)
-                if fileURL.pathExtension.lowercased() == "geojson" {
-                    // Проверяем, есть ли трек, без которого невозможно определить bbox
-                    guard !trackCoordinates.isEmpty else {
-                        self.updateProgress("Не удалось загрузить трек для определения области отображения дорог")
-                        DispatchQueue.main.async {
-                            self.isLoading = false
-                        }
-                        return
+        }
+        return trackCoordinates
+    }
+    func loadRoads(trackCoordinates: [CLLocationCoordinate2D]) async {
+        await updateProgress("Загрузка дорог из GeoJSON...")
+        if let filePath = Bundle.main.path(forResource: TrackType.road.fileName, ofType: nil) {
+            let fileURL = URL(fileURLWithPath: filePath)
+            if fileURL.pathExtension.lowercased() == "geojson" {
+                // Проверяем, есть ли трек, без которого невозможно определить bbox
+                guard !trackCoordinates.isEmpty else {
+                    await updateProgress("Не удалось загрузить трек для определения области отображения дорог")
+                    await MainActor.run {
+                        self.isLoading = false
                     }
-                    
-                    // Вычисляем ограничивающий прямоугольник трека для оптимизации
-                    // Явно используем bbox для фильтрации дорог
-                    let bbox = self.getTrackBoundingBox(trackCoordinates, expandBy: 0.05)
-                    print("BBox трека: оригинальный = (\(bbox.original.minLat), \(bbox.original.maxLat), \(bbox.original.minLon), \(bbox.original.maxLon))")
-                    print("BBox трека: расширенный = (\(bbox.expanded.minLat), \(bbox.expanded.maxLat), \(bbox.expanded.minLon), \(bbox.expanded.maxLon))")
-                    
-                    // Увеличиваем максимальное количество дорог
-                    let maxRoads = 150000 // Увеличено с 10000 до 15000 для отображения большего количества дорог
-                    
-                    self.updateProgress("Чтение GeoJSON файла с фильтрацией по области трека...")
-                    
-                    // Создаем наблюдателя прогресса
-                    let progressObserver = NotificationCenter.default.addObserver(
-                        forName: .roadLoadingProgress, 
-                        object: nil, 
-                        queue: .main) { [weak self] notification in
+                    return
+                }
+                
+                // Вычисляем ограничивающий прямоугольник трека для оптимизации
+                // Явно используем bbox для фильтрации дорог
+                let bbox = self.getTrackBoundingBox(trackCoordinates, expandBy: 0.05)
+                print("BBox трека: оригинальный = (\(bbox.original.minLat), \(bbox.original.maxLat), \(bbox.original.minLon), \(bbox.original.maxLon))")
+                print("BBox трека: расширенный = (\(bbox.expanded.minLat), \(bbox.expanded.maxLat), \(bbox.expanded.minLon), \(bbox.expanded.maxLon))")
+                
+                // Увеличиваем максимальное количество дорог
+                let maxRoads = 150000 // Увеличено с 10000 до 15000 для отображения большего количества дорог
+                
+                await updateProgress("Чтение GeoJSON файла с фильтрацией по области трека...")
+                
+                // Создаем наблюдателя прогресса
+                let progressObserver = NotificationCenter.default.addObserver(
+                    forName: .roadLoadingProgress,
+                    object: nil,
+                    queue: .main) { [weak self] notification in
                         if let progress = notification.userInfo?["progress"] as? String {
-                            self?.updateProgress(progress)
+                            Task { @MainActor in
+                                self?.loadingProgress = progress
+                                print("Прогресс: \(progress)")
+                            }
                             
                             // Если есть временные дороги, обновляем их
                             if let temporaryRoads = notification.userInfo?["roads"] as? [Road],
                                !temporaryRoads.isEmpty {
-                                DispatchQueue.main.async {
+                                Task { @MainActor in
                                     // Обновляем дороги по мере их загрузки для интерактивности
                                     self?.roads = temporaryRoads
                                 }
                             }
                         }
                     }
+                
+                // ВАЖНО: Явно передаем bbox для фильтрации, используя расширенный bbox
+                let allRoads = TrackParser.parseGeoJSONToRoadsLazy(
+                    fileURL,
+                    boundingBox: bbox.expanded, // Явно используем расширенный bbox
+                    maxRoads: maxRoads
+                )
+                
+                // Удаляем наблюдателя
+                NotificationCenter.default.removeObserver(progressObserver)
+                
+                print("Загружено всего \(allRoads.count) дорог из GeoJSON (ограничено до \(maxRoads))")
+                print("Статистика дорог:")
+                print("- Дороги с 1 точкой: \(allRoads.filter { $0.coordinates.count == 1 }.count)")
+                print("- Дороги с 2 точками: \(allRoads.filter { $0.coordinates.count == 2 }.count)")
+                print("- Дороги с 3+ точками: \(allRoads.filter { $0.coordinates.count > 2 }.count)")
+                
+                await updateProgress("Фильтрация дорог по области трека (\(allRoads.count) загружено)...")
+                
+                // Дополнительная фильтрация дорог по bbox
+                // Проверяем только те дороги, которые имеют хотя бы одну точку в расширенном bbox трека
+                let filteredRoads = self.filterRoadsByBBox(roads: allRoads, bbox: bbox.expanded)
+                print("После дополнительной фильтрации осталось \(filteredRoads.count) дорог")
+                
+                // Определяем дороги, используемые треком
+                await updateProgress("Определение дорог, используемых треком (\(filteredRoads.count) дорог)...")
+                let usedRoads = self.markUsedRoads(roads: filteredRoads, trackCoordinates: trackCoordinates)
+                
+                // ВАЖНО: Проверяем, что у нас есть дороги для отображения
+                if usedRoads.isEmpty {
+                    print("ОШИБКА: Не найдено дорог для отображения")
+                    await updateProgress("Не найдено дорог в указанной области")
+                } else {
+                    print("Инициализация оверлеев с \(usedRoads.count) дорогами")
                     
-                    // ВАЖНО: Явно передаем bbox для фильтрации, используя расширенный bbox
-                    let allRoads = TrackParser.parseGeoJSONToRoadsLazy(
-                        fileURL, 
-                        boundingBox: bbox.expanded, // Явно используем расширенный bbox
-                        maxRoads: maxRoads
-                    )
-                    
-                    // Удаляем наблюдателя
-                    NotificationCenter.default.removeObserver(progressObserver)
-                    
-                    print("Загружено всего \(allRoads.count) дорог из GeoJSON (ограничено до \(maxRoads))")
-                    print("Статистика дорог:")
-                    print("- Дороги с 1 точкой: \(allRoads.filter { $0.coordinates.count == 1 }.count)")
-                    print("- Дороги с 2 точками: \(allRoads.filter { $0.coordinates.count == 2 }.count)")
-                    print("- Дороги с 3+ точками: \(allRoads.filter { $0.coordinates.count > 2 }.count)")
-                    
-                    self.updateProgress("Фильтрация дорог по области трека (\(allRoads.count) загружено)...")
-                    
-                    // Дополнительная фильтрация дорог по bbox
-                    // Проверяем только те дороги, которые имеют хотя бы одну точку в расширенном bbox трека
-                    let filteredRoads = self.filterRoadsByBBox(roads: allRoads, bbox: bbox.expanded)
-                    print("После дополнительной фильтрации осталось \(filteredRoads.count) дорог")
-                    
-                    // Определяем дороги, используемые треком
-                    self.updateProgress("Определение дорог, используемых треком (\(filteredRoads.count) дорог)...")
-                    let usedRoads = self.markUsedRoads(roads: filteredRoads, trackCoordinates: trackCoordinates)
-                    
-                    // ВАЖНО: Проверяем, что у нас есть дороги для отображения
-                    if usedRoads.isEmpty {
-                        print("ОШИБКА: Не найдено дорог для отображения")
-                        self.updateProgress("Не найдено дорог в указанной области")
-                    } else {
-                        print("Инициализация оверлеев с \(usedRoads.count) дорогами")
-                        
-                        let usedRoadsCount = usedRoads.filter { $0.isUsedByTrack }.count
-                        print("Из них используется треком: \(usedRoadsCount)")
-                    }
-                    
-                    // Обновляем UI с дорогами сразу, не дожидаясь доп. обработки
-                    DispatchQueue.main.async {
-                        self.roads = usedRoads
-                        
-                        // Создаем оверлеи дорог для более эффективной отрисовки
-                        // Один оверлей для всех дорог
-                        self.roadsOverlay = RoadsOverlay(roads: usedRoads, isUsedRoadsOnly: false)
-                        
-                        // Дополнительный оверлей только для дорог, используемых треком
-                        self.usedRoadsOverlay = RoadsOverlay(roads: usedRoads, isUsedRoadsOnly: true)
-                        
-                        print("Оверлеи созданы: all roads(\(usedRoads.count)), used roads(\(usedRoads.filter { $0.isUsedByTrack }.count))")
-                        
-                        // Уведомляем UI об обновлении оверлеев
-                        self.objectWillChange.send()
-                    }
-                    
-                    // ОПТИМИЗАЦИЯ: Используем только подмножество дорог для map matching
-                    self.updateProgress("Подготовка дорожных сегментов для сопоставления...")
-                    
-                    // Добавляем отладочную информацию
                     let usedRoadsCount = usedRoads.filter { $0.isUsedByTrack }.count
-                    let allRoadsCount = usedRoads.count
-                    print("Всего дорог: \(allRoadsCount), используемых треком: \(usedRoadsCount)")
-                    self.updateProgress("Найдено \(usedRoadsCount) дорог, используемых треком из \(allRoadsCount) общего количества")
+                    print("Из них используется треком: \(usedRoadsCount)")
+                }
+                
+                // Обновляем UI с дорогами сразу, не дожидаясь доп. обработки
+                await MainActor.run {
+                    self.roads = usedRoads
                     
-                    // ОПТИМИЗАЦИЯ: Используем только дороги, которые помечены как используемые треком
-                    let roadsForMapping = usedRoads.filter { $0.isUsedByTrack }
+                    // Создаем оверлеи дорог для более эффективной отрисовки
+                    // Один оверлей для всех дорог
+                    self.roadsOverlay = RoadsOverlay(roads: usedRoads, isUsedRoadsOnly: false)
                     
-                    // Если дорог для маппинга мало, добавляем некоторые неиспользуемые дороги
-                    var finalRoadsForMapping = roadsForMapping
-                    if roadsForMapping.count < 50 {
-                        print("Мало дорог для маппинга (\(roadsForMapping.count)), добавляем часть неиспользуемых")
-                        let unusedRoads = usedRoads.filter { !$0.isUsedByTrack }
-                        let additionalRoads = unusedRoads.count > 100 ? Array(unusedRoads.prefix(100)) : unusedRoads
-                        finalRoadsForMapping = roadsForMapping + additionalRoads
-                    }
+                    // Дополнительный оверлей только для дорог, используемых треком
+                    self.usedRoadsOverlay = RoadsOverlay(roads: usedRoads, isUsedRoadsOnly: true)
                     
-                    print("Использую \(finalRoadsForMapping.count) дорог для маппинга")
+                    print("Оверлеи созданы: all roads(\(usedRoads.count)), used roads(\(usedRoads.filter { $0.isUsedByTrack }.count))")
                     
-                    // Извлекаем координаты для маппинга
-                    let roadCoordinates = self.extractCoordinatesForMapMatching(roads: finalRoadsForMapping)
-                    print("Извлечено \(roadCoordinates.count) координат для маппинга")
+                    // Уведомляем UI об обновлении оверлеев
+                    self.objectWillChange.send()
+                }
+                
+                // ОПТИМИЗАЦИЯ: Используем только подмножество дорог для map matching
+                await updateProgress("Подготовка дорожных сегментов для сопоставления...")
+                
+                // Добавляем отладочную информацию
+                let usedRoadsCount = usedRoads.filter { $0.isUsedByTrack }.count
+                let allRoadsCount = usedRoads.count
+                print("Всего дорог: \(allRoadsCount), используемых треком: \(usedRoadsCount)")
+                await updateProgress("Найдено \(usedRoadsCount) дорог, используемых треком из \(allRoadsCount) общего количества")
+                
+                // ОПТИМИЗАЦИЯ: Используем только дороги, которые помечены как используемые треком
+                let roadsForMapping = usedRoads.filter { $0.isUsedByTrack }
+                
+                // Если дорог для маппинга мало, добавляем некоторые неиспользуемые дороги
+                var finalRoadsForMapping = roadsForMapping
+                if roadsForMapping.count < 50 {
+                    print("Мало дорог для маппинга (\(roadsForMapping.count)), добавляем часть неиспользуемых")
+                    let unusedRoads = usedRoads.filter { !$0.isUsedByTrack }
+                    let additionalRoads = unusedRoads.count > 100 ? Array(unusedRoads.prefix(100)) : unusedRoads
+                    finalRoadsForMapping = roadsForMapping + additionalRoads
+                }
+                
+                print("Использую \(finalRoadsForMapping.count) дорог для маппинга")
+                
+                // Извлекаем координаты для маппинга
+                let roadCoordinates = self.extractCoordinatesForMapMatching(roads: finalRoadsForMapping)
+                self.roadSegments = coordinateConverter.convertToRoadSegments(coordinates: roadCoordinates)
+                print("Извлечено \(roadCoordinates.count) координат для маппинга")
+                
+                if !roadCoordinates.isEmpty {
+                    print("Создано \(self.roadSegments.count) дорожных сегментов")
                     
-                    if !roadCoordinates.isEmpty {
-                        // Упрощаем координаты дорог
-                        self.updateProgress("Преобразование в сегменты (\(roadCoordinates.count) точек)...")
-                        self.roadSegments = self.coordinateConverter.convertToRoadSegments(
-                            coordinates: roadCoordinates, 
-                            minSegmentLength: 10.0 // Увеличено для уменьшения количества сегментов
+                    // Если у нас есть трек и дорожные сегменты, делаем map matching
+                    if !trackCoordinates.isEmpty && !self.roadSegments.isEmpty {
+                        await updateProgress("Сопоставление трека с дорогами (\(self.roadSegments.count) сегментов)...")
+                        // Создаем скорректированный трек
+                        let correctedCoordinates = self.mapMatcher.matchTrack(gpsTrack: self.trackPoints, roadSegments: self.roadSegments, maxDistance: 15, forceSnapToRoad: true, maxForceSnapDistance: 30, removeDuplicates: true, fillGaps: true, simplifyTrack: false)
+                        
+                        let correctedTrack = Track(
+                            name: "\(fileURL.deletingPathExtension().lastPathComponent)_corrected",
+                            coordinates: correctedCoordinates,
+                            color: .green
                         )
                         
-                        print("Создано \(self.roadSegments.count) дорожных сегментов")
-                        
-                        // Ограничиваем количество сегментов для предотвращения зависаний
-                        if self.roadSegments.count > 5000 {
-                            print("Слишком много сегментов, ограничиваем до 5000")
-                            self.updateProgress("Оптимизация количества сегментов (было \(self.roadSegments.count))...")
-                            self.roadSegments = Array(self.roadSegments.prefix(5000))
-                        }
-                        
-                        // Если у нас есть трек и дорожные сегменты, делаем map matching
-                        if !trackCoordinates.isEmpty && !self.roadSegments.isEmpty {
-                            self.updateProgress("Сопоставление трека с дорогами (\(self.roadSegments.count) сегментов)...")
-                            
-                            // Создаем скорректированный трек
-                            let correctedCoordinates = self.mapMatcher.matchTrackWithErrorCorrection(
-                                gpsTrack: self.trackPoints,
-                                roadSegments: self.roadSegments,
-                                maxDistance: 15.0,
-                                forceSnapToRoad: true,
-                                maxForceSnapDistance: 30.0
-                            )
-                            
-                            let correctedTrack = Track(
-                                name: "\(fileURL.deletingPathExtension().lastPathComponent)_corrected",
-                                coordinates: correctedCoordinates,
-                                color: .green
-                            )
-                            
-                            // Обновляем UI с обоими треками
-                            DispatchQueue.main.async {
-                                if let originalTrack = self.originalTrack {
-                                    self.tracks = [originalTrack, correctedTrack]
-                                }
+                        // Обновляем UI с обоими треками
+                        await MainActor.run {
+                            if let originalTrack = self.originalTrack {
+                                self.tracks = [originalTrack, correctedTrack]
                             }
                         }
                     }
                 }
             }
-            
-            // Завершаем загрузку
-            self.updateProgress("Загрузка завершена")
-            DispatchQueue.main.async {
-                self.isLoading = false
-            }
         }
+        
     }
-    
     // Метод для обновления прогресса загрузки
-    private func updateProgress(_ message: String) {
-        DispatchQueue.main.async {
+    func updateProgress(_ message: String) async {
+        await MainActor.run {
             self.loadingProgress = message
             print("Прогресс: \(message)")
         }
     }
     
     // Вычисляет ограничивающий прямоугольник трека и его расширенную версию
-    private func getTrackBoundingBox(_ coordinates: [CLLocationCoordinate2D], expandBy: Double) -> (
+    func getTrackBoundingBox(_ coordinates: [CLLocationCoordinate2D], expandBy: Double) -> (
         original: (minLat: Double, maxLat: Double, minLon: Double, maxLon: Double),
         expanded: (minLat: Double, maxLat: Double, minLon: Double, maxLon: Double)
     ) {
@@ -305,7 +304,7 @@ final class MapModel: ObservableObject {
     }
     
     // Проверяет, находится ли точка рядом с дорогой
-    private func isPointNearRoad(point: CLLocationCoordinate2D, road: Road, maxDistance: Double) -> Bool {
+    func isPointNearRoad(point: CLLocationCoordinate2D, road: Road, maxDistance: Double) -> Bool {
         let pointLocation = CLLocation(latitude: point.latitude, longitude: point.longitude)
         
         // Проверяем расстояние до каждого сегмента дороги
@@ -327,9 +326,9 @@ final class MapModel: ObservableObject {
     }
     
     // Функция вычисления расстояния между точкой и линией (в метрах)
-    private func distanceFromPoint(_ point: CLLocationCoordinate2D,
-                                 toLineSegment start: CLLocationCoordinate2D,
-                                 end: CLLocationCoordinate2D) -> Double {
+    func distanceFromPoint(_ point: CLLocationCoordinate2D,
+                           toLineSegment start: CLLocationCoordinate2D,
+                           end: CLLocationCoordinate2D) -> Double {
         let location = CLLocation(latitude: point.latitude, longitude: point.longitude)
         let startLocation = CLLocation(latitude: start.latitude, longitude: start.longitude)
         let endLocation = CLLocation(latitude: end.latitude, longitude: end.longitude)
@@ -340,7 +339,7 @@ final class MapModel: ObservableObject {
         }
         
         var t = ((point.latitude - start.latitude) * (end.latitude - start.latitude) +
-                (point.longitude - start.longitude) * (end.longitude - start.longitude)) / (lineLength * lineLength)
+                 (point.longitude - start.longitude) * (end.longitude - start.longitude)) / (lineLength * lineLength)
         t = max(0, min(1, t))
         
         let nearestLat = start.latitude + t * (end.latitude - start.latitude)
@@ -351,7 +350,7 @@ final class MapModel: ObservableObject {
     }
     
     // Проверяет, соединяются ли две дороги (имеют близкие конечные точки)
-    private func areRoadsConnected(road1: Road, road2: Road, maxDistance: Double) -> Bool {
+    func areRoadsConnected(road1: Road, road2: Road, maxDistance: Double) -> Bool {
         guard !road1.coordinates.isEmpty && !road2.coordinates.isEmpty else { return false }
         
         // Получаем начальные и конечные точки обеих дорог
@@ -371,14 +370,14 @@ final class MapModel: ObservableObject {
     }
     
     // Вычисляет расстояние между двумя координатами в метрах
-    private func calculateDistance(coord1: CLLocationCoordinate2D, coord2: CLLocationCoordinate2D) -> Double {
+    func calculateDistance(coord1: CLLocationCoordinate2D, coord2: CLLocationCoordinate2D) -> Double {
         let location1 = CLLocation(latitude: coord1.latitude, longitude: coord1.longitude)
         let location2 = CLLocation(latitude: coord2.latitude, longitude: coord2.longitude)
         return location1.distance(from: location2)
     }
     
     // Новый метод для фильтрации дорог по bbox
-    private func filterRoadsByBBox(roads: [Road], bbox: (minLat: Double, maxLat: Double, minLon: Double, maxLon: Double)) -> [Road] {
+    func filterRoadsByBBox(roads: [Road], bbox: (minLat: Double, maxLat: Double, minLon: Double, maxLon: Double)) -> [Road] {
         print("\nФильтрация дорог по bbox:")
         print("- Всего дорог до фильтрации: \(roads.count)")
         print("- Bbox: \(bbox)")
@@ -407,14 +406,14 @@ final class MapModel: ObservableObject {
     }
     
     // Оптимизированный метод для маркировки дорог, используемых треком
-    private func markUsedRoads(roads: [Road], trackCoordinates: [CLLocationCoordinate2D]) -> [Road] {
+    func markUsedRoads(roads: [Road], trackCoordinates: [CLLocationCoordinate2D]) -> [Road] {
         guard !trackCoordinates.isEmpty else { return roads }
         
         let startTime = Date()
         
         // Создаем упрощенный трек с меньшей толерантностью для более точного определения используемых дорог
         let simplifiedTrack = coordinateConverter.simplifyTrack(
-            coordinates: trackCoordinates, 
+            coordinates: trackCoordinates,
             tolerance: 5.0 // Уменьшено с 15.0 до 5.0 для сохранения более детального трека
         )
         
@@ -464,15 +463,15 @@ final class MapModel: ObservableObject {
                     // Быстрая проверка: есть ли хоть один сегмент трека, который пересекается с дорогой
                     for segment in trackSegmentBounds {
                         // Проверяем пересечение ограничивающих прямоугольников
-                        if !(roadBBox.maxLat < segment.minLat || 
+                        if !(roadBBox.maxLat < segment.minLat ||
                              roadBBox.minLat > segment.maxLat ||
-                             roadBBox.maxLon < segment.minLon || 
+                             roadBBox.maxLon < segment.minLon ||
                              roadBBox.minLon > segment.maxLon) {
                             
                             // Более детальная проверка только для потенциально пересекающихся
                             let distance = self.approximateDistanceFromRoadToSegment(
-                                road: road, 
-                                segmentStart: segment.start, 
+                                road: road,
+                                segmentStart: segment.start,
                                 segmentEnd: segment.end
                             )
                             
@@ -508,7 +507,7 @@ final class MapModel: ObservableObject {
     }
     
     // Оптимизированный метод для быстрой приблизительной проверки расстояния между дорогой и сегментом трека
-    private func approximateDistanceFromRoadToSegment(road: Road, segmentStart: CLLocationCoordinate2D, segmentEnd: CLLocationCoordinate2D) -> Double {
+    func approximateDistanceFromRoadToSegment(road: Road, segmentStart: CLLocationCoordinate2D, segmentEnd: CLLocationCoordinate2D) -> Double {
         guard !road.coordinates.isEmpty else { return Double.infinity }
         
         // Для скорости проверяем только начало и конец дороги
@@ -526,7 +525,7 @@ final class MapModel: ObservableObject {
     }
     
     // Метод для извлечения координат только для map matching (для оптимизации)
-    private func extractCoordinatesForMapMatching(roads: [Road]) -> [CLLocationCoordinate2D] {
+    func extractCoordinatesForMapMatching(roads: [Road]) -> [CLLocationCoordinate2D] {
         // Берем только используемые дороги и строго ограничиваем их количество
         let usedRoads = roads.filter { $0.isUsedByTrack }
         

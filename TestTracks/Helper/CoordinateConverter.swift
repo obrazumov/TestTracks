@@ -9,17 +9,26 @@
 import CoreLocation
 
 // Структура для дорожного сегмента (уже определена ранее)
-struct RoadSegment {
+struct RoadSegment: Hashable {
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+    }
+    let id = UUID().uuidString
     let start: CLLocationCoordinate2D
     let end: CLLocationCoordinate2D
     
     // Информация о направлении дороги
     let isOneway: Bool
     let forwardDirection: Bool  // true если направление от start к end является разрешенным
+    var direction: Double {
+            let deltaX = end.longitude - start.longitude
+            let deltaY = end.latitude - start.latitude
+            return atan2(deltaX, deltaY) * 180.0 / .pi // Угол в градусах
+        }
     
     // Инициализатор с дефолтными значениями для обратной совместимости
     init(start: CLLocationCoordinate2D, end: CLLocationCoordinate2D, 
-         isOneway: Bool = false, forwardDirection: Bool = true) {
+         isOneway: Bool = true, forwardDirection: Bool = true) {
         self.start = start
         self.end = end
         self.isOneway = isOneway

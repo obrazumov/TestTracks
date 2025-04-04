@@ -20,5 +20,81 @@
             landmarkType = "7">
          </BreakpointContent>
       </BreakpointProxy>
+      <BreakpointProxy
+         BreakpointExtensionID = "Xcode.Breakpoint.FileBreakpoint">
+         <BreakpointContent
+            uuid = "A6BD13CE-E783-4F22-A109-A047C6F08085"
+            shouldBeEnabled = "Yes"
+            ignoreCount = "0"
+            continueAfterRunningActions = "No"
+            filePath = "TestTracks/Helper/MyMapMatcher.swift"
+            startingColumnNumber = "9223372036854775807"
+            endingColumnNumber = "9223372036854775807"
+            startingLineNumber = "183"
+            endingLineNumber = "183"
+            landmarkName = "correctTrack(observations:roadSegments:)"
+            landmarkType = "7">
+         </BreakpointContent>
+      </BreakpointProxy>
+      <BreakpointProxy
+         BreakpointExtensionID = "Xcode.Breakpoint.FileBreakpoint">
+         <BreakpointContent
+            uuid = "7CD45066-3A8B-4395-B052-6C5882CC3115"
+            shouldBeEnabled = "Yes"
+            ignoreCount = "0"
+            continueAfterRunningActions = "No"
+            filePath = "TestTracks/Helper/MyMapMatcher.swift"
+            startingColumnNumber = "9223372036854775807"
+            endingColumnNumber = "9223372036854775807"
+            startingLineNumber = "97"
+            endingLineNumber = "97"
+            landmarkName = "findClosestRoadSegments(for:previousLocation:roadSegments:)"
+            landmarkType = "7">
+            <Locations>
+               <Location
+                  uuid = "7CD45066-3A8B-4395-B052-6C5882CC3115 - 642c2d14e829e95e"
+                  shouldBeEnabled = "Yes"
+                  ignoreCount = "0"
+                  continueAfterRunningActions = "No"
+                  symbolName = "closure #2 (TestTracks.RoadSegment) -&gt; Swift.Bool in TestTracks.MyMapMatcher.findClosestRoadSegments(for: __C.CLLocationCoordinate2D, previousLocation: Swift.Optional&lt;__C.CLLocationCoordinate2D&gt;, roadSegments: Swift.Array&lt;TestTracks.RoadSegment&gt;) -&gt; Swift.Array&lt;TestTracks.RoadSegment&gt;"
+                  moduleName = "TestTracks.debug.dylib"
+                  usesParentBreakpointCondition = "Yes"
+                  urlString = "file:///Users/admin/IOS/TestTracks/TestTracks/Helper/MyMapMatcher.swift"
+                  startingColumnNumber = "9223372036854775807"
+                  endingColumnNumber = "9223372036854775807"
+                  startingLineNumber = "97"
+                  endingLineNumber = "97">
+               </Location>
+               <Location
+                  uuid = "7CD45066-3A8B-4395-B052-6C5882CC3115 - 48f7b295e1be33d"
+                  shouldBeEnabled = "Yes"
+                  ignoreCount = "0"
+                  continueAfterRunningActions = "No"
+                  symbolName = "TestTracks.MyMapMatcher.findClosestRoadSegments(for: __C.CLLocationCoordinate2D, previousLocation: Swift.Optional&lt;__C.CLLocationCoordinate2D&gt;, roadSegments: Swift.Array&lt;TestTracks.RoadSegment&gt;) -&gt; Swift.Array&lt;TestTracks.RoadSegment&gt;"
+                  moduleName = "TestTracks.debug.dylib"
+                  usesParentBreakpointCondition = "Yes"
+                  urlString = "file:///Users/admin/IOS/TestTracks/TestTracks/Helper/MyMapMatcher.swift"
+                  startingColumnNumber = "9223372036854775807"
+                  endingColumnNumber = "9223372036854775807"
+                  startingLineNumber = "97"
+                  endingLineNumber = "97">
+               </Location>
+               <Location
+                  uuid = "7CD45066-3A8B-4395-B052-6C5882CC3115 - fd170a1720e8bf6b"
+                  shouldBeEnabled = "Yes"
+                  ignoreCount = "0"
+                  continueAfterRunningActions = "No"
+                  symbolName = "closure #4 (TestTracks.RoadSegment) -&gt; TestTracks.RoadSegment in TestTracks.MyMapMatcher.findClosestRoadSegments(for: __C.CLLocationCoordinate2D, previousLocation: Swift.Optional&lt;__C.CLLocationCoordinate2D&gt;, roadSegments: Swift.Array&lt;TestTracks.RoadSegment&gt;) -&gt; Swift.Array&lt;TestTracks.RoadSegment&gt;"
+                  moduleName = "TestTracks.debug.dylib"
+                  usesParentBreakpointCondition = "Yes"
+                  urlString = "file:///Users/admin/IOS/TestTracks/TestTracks/Helper/MyMapMatcher.swift"
+                  startingColumnNumber = "9223372036854775807"
+                  endingColumnNumber = "9223372036854775807"
+                  startingLineNumber = "97"
+                  endingLineNumber = "97">
+               </Location>
+            </Locations>
+         </BreakpointContent>
+      </BreakpointProxy>
    </Breakpoints>
 </Bucket>
