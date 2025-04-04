@@ -16,14 +16,17 @@ struct TestCandidat {
     let trackPoint: TrackPoint
     let newPoint: CLLocationCoordinate2D
     let candidates: [RoadSegment]
-    var color: UIColor = {
-        return UIColor(
+    var color: UIColor = .random()
+}
+
+extension UIColor {
+    static func random() -> UIColor {
+        UIColor(
             red: CGFloat.random(in: 0...1),
             green: CGFloat.random(in: 0...1),
             blue: CGFloat.random(in: 0...1),
-            alpha: 1.0
-        )
-    }()
+            alpha: 1.0)
+    }
 }
 
 extension MyMapMatcher: MapMatching {
@@ -37,43 +40,9 @@ extension MyMapMatcher: MapMatching {
     func matchTrackCandidat(gpsTrack: [TrackPoint], roadSegments: [RoadSegment], index: Int) async -> TestCandidat? {
         let point = gpsTrack[index].coordinate
         let previousLocation = index > 0 ? gpsTrack[index - 1].coordinate : nil
-        let candidates = findClosestRoadSegments(for: point, previousLocation: previousLocation, roadSegments: roadSegments)
-        
-                
-        // Для каждой наблюдаемой точки выбираем ближайшие дороги
-        var stateProbabilities: [RoadSegment: Double] = [:]
-        var newStateProbabilities: [RoadSegment: Double] = [:]
-        
-        for candidate in candidates {
-            let obsProb = observationProbability(observed: point, road: candidate)
-            
-            if index == 0 {
-                // Первая точка: просто берем наблюдение
-                newStateProbabilities[candidate] = obsProb
-            } else {
-                // Выбираем наиболее вероятный предыдущий переход
-                var maxProb = 0.0
-                for prevState in stateProbabilities.keys {
-                    let transProb = transitionProbability(from: prevState, to: candidate)
-                    let prob = stateProbabilities[prevState]! * transProb * obsProb
-                    if prob > maxProb {
-                        maxProb = prob
-                    }
-                }
-                newStateProbabilities[candidate] = maxProb
-            }
-        }
-        
-        // Обновляем вероятности
-        stateProbabilities = newStateProbabilities
-        
-        // Выбираем наилучшую дорогу для текущей точки
-        if let bestMatch = stateProbabilities.max(by: { $0.value < $1.value })?.key {
-            let newCoordinate = projectPointOntoSegment(point: point, segmentStart: bestMatch.start, segmentEnd: bestMatch.end)
-            return TestCandidat(trackPoint: gpsTrack[index], newPoint: newCoordinate, candidates: candidates)
-        } else {
-            return nil
-        }
+        guard let candidate = findClosestRoadSegments(for: point, previousLocation: previousLocation, roadSegments: roadSegments) else { return nil }
+        let newCoordinate = projectPointOntoSegment(point: point, segmentStart: candidate.start, segmentEnd: candidate.end)
+        return TestCandidat(trackPoint: gpsTrack[index], newPoint: newCoordinate, candidates: [candidate])
     }
 }
 
@@ -81,20 +50,20 @@ private extension MyMapMatcher {
     // Функция поиска ближайших сегментов дороги к координате
     func findClosestRoadSegments(for location: CLLocationCoordinate2D,
                                  previousLocation: CLLocationCoordinate2D?,
-                                 roadSegments: [RoadSegment]) -> [RoadSegment] {
+                                 roadSegments: [RoadSegment]) -> RoadSegment? {
         // Вычисляем heading только если есть предыдущая точка
         let locationHeading = previousLocation.map { calculateHeading(from: $0, to: location) } ?? 0.0
 
-        let filterSegments =  roadSegments.filter {
-                let angleDiff = abs($0.direction - locationHeading)
-                return angleDiff < 30.0 || angleDiff > 330.0 // Учитываем циклический характер углов (0-360)
-            }
-        let sortedSegments = filterSegments.sorted {
+//        let filterSegments =  roadSegments.filter {
+//                let angleDiff = abs($0.direction - locationHeading)
+//                return angleDiff < 30.0 || angleDiff > 330.0 // Учитываем циклический характер углов (0-360)
+//            }
+        let sortedSegments = roadSegments.sorted {
             let projectionPoint1 = projectPointOntoSegment(point: location, segmentStart: $0.start, segmentEnd: $0.end)
             let projectionPoint2 = projectPointOntoSegment(point: location, segmentStart: $1.start, segmentEnd: $1.end)
             return distance(from: location, to: projectionPoint1) < distance(from: location, to: projectionPoint2)
             }
-        return sortedSegments.prefix(2).map { $0 }
+        return sortedSegments.first
     }
     func calculateHeading(from: CLLocationCoordinate2D, to: CLLocationCoordinate2D) -> Double {
         let deltaX = to.longitude - from.longitude
@@ -110,13 +79,22 @@ private extension MyMapMatcher {
 
     // Вероятность наблюдения точки на данном сегменте
     func observationProbability(observed: CLLocationCoordinate2D, road: RoadSegment) -> Double {
-        let d = min(distance(from: observed, to: road.start), distance(from: observed, to: road.end))
-        return exp(-d / 50.0) // Чем ближе к дороге, тем выше вероятность (50 м - стандартное отклонение)
+        let d = min(distance(from: observed, to: road.start), distance(from: observed, to: road.end), distance(from: observed, to: projectPointOntoSegment(point: observed, segmentStart: road.start, segmentEnd: road.end)))
+        return exp(-d / 10.0) // Чем ближе к дороге, тем выше вероятность (50 м - стандартное отклонение)
     }
     
     // Вероятность перехода между дорогами (чем естественнее переход, тем выше вероятность)
     func transitionProbability(from: RoadSegment, to: RoadSegment) -> Double {
-        return from.end.latitude == to.start.latitude && from.end.longitude == to.start.longitude ? 0.9 : 0.1
+        // Высокая вероятность если сегменты принадлежат одной дороге и конец первого совпадает с началом второго
+        if from.roadId == to.roadId {
+            return 0.9
+        }
+        // Средняя вероятность если конец первого совпадает с началом второго, но дороги разные 
+        else if from.end.latitude == to.start.latitude && from.end.longitude == to.start.longitude {
+            return 0.8
+        }
+        // Низкая вероятность в остальных случаях
+        return 0.1
     }
     
     // Алгоритм Витерби для корректировки трека
@@ -132,25 +110,25 @@ private extension MyMapMatcher {
 
             var newStateProbabilities: [RoadSegment: Double] = [:]
             
-            for candidate in candidates {
-                let obsProb = observationProbability(observed: observation.coordinate, road: candidate)
-                
-                if index == 0 {
-                    // Первая точка: просто берем наблюдение
-                    newStateProbabilities[candidate] = obsProb
-                } else {
-                    // Выбираем наиболее вероятный предыдущий переход
-                    var maxProb = 0.0
-                    for prevState in stateProbabilities.keys {
-                        let transProb = transitionProbability(from: prevState, to: candidate)
-                        let prob = stateProbabilities[prevState]! * transProb * obsProb
-                        if prob > maxProb {
-                            maxProb = prob
-                        }
-                    }
-                    newStateProbabilities[candidate] = maxProb
-                }
-            }
+//            for candidate in candidates {
+//                let obsProb = observationProbability(observed: observation.coordinate, road: candidate)
+//                
+//                if index == 0 {
+//                    // Первая точка: просто берем наблюдение
+//                    newStateProbabilities[candidate] = obsProb
+//                } else {
+//                    // Выбираем наиболее вероятный предыдущий переход
+//                    var maxProb = 0.0
+//                    for prevState in stateProbabilities.keys {
+//                        let transProb = transitionProbability(from: prevState, to: candidate)
+//                        let prob = stateProbabilities[prevState]! * transProb * obsProb
+//                        if prob > maxProb {
+//                            maxProb = prob
+//                        }
+//                    }
+//                    newStateProbabilities[candidate] = maxProb
+//                }
+//            }
             
             // Обновляем вероятности
             stateProbabilities = newStateProbabilities
@@ -177,25 +155,25 @@ private extension MyMapMatcher {
 
             var newStateProbabilities: [RoadSegment: Double] = [:]
             
-            for candidate in candidates {
-                let obsProb = observationProbability(observed: observation.coordinate, road: candidate)
-                
-                if index == 0 {
-                    // Первая точка: просто берем наблюдение
-                    newStateProbabilities[candidate] = obsProb
-                } else {
-                    // Выбираем наиболее вероятный предыдущий переход
-                    var maxProb = 0.0
-                    for prevState in stateProbabilities.keys {
-                        let transProb = transitionProbability(from: prevState, to: candidate)
-                        let prob = stateProbabilities[prevState]! * transProb * obsProb
-                        if prob > maxProb {
-                            maxProb = prob
-                        }
-                    }
-                    newStateProbabilities[candidate] = maxProb
-                }
-            }
+//            for candidate in candidates {
+//                let obsProb = observationProbability(observed: observation.coordinate, road: candidate)
+//                
+//                if index == 0 {
+//                    // Первая точка: просто берем наблюдение
+//                    newStateProbabilities[candidate] = obsProb
+//                } else {
+//                    // Выбираем наиболее вероятный предыдущий переход
+//                    var maxProb = 0.0
+//                    for prevState in stateProbabilities.keys {
+//                        let transProb = transitionProbability(from: prevState, to: candidate)
+//                        let prob = stateProbabilities[prevState]! * transProb * obsProb
+//                        if prob > maxProb {
+//                            maxProb = prob
+//                        }
+//                    }
+//                    newStateProbabilities[candidate] = maxProb
+//                }
+//            }
             
             // Обновляем вероятности
             stateProbabilities = newStateProbabilities

@@ -98,10 +98,76 @@ struct MapView: View {
                 )
             }
             
+            // Индикатор прогресса обработки
+            if model.isProcessing {
+                VStack {
+                    Text("Обработка точек трека")
+                        .foregroundColor(.white)
+                        .font(.headline)
+                    
+                    // Отображаем процент выполнения и количество обработанных точек
+                    HStack {
+                        let processedPoints = Int(Float(model.trackPointCount) * model.processingProgress)
+                        let totalPoints = model.trackPointCount
+                        Text("\(processedPoints)/\(totalPoints) точек")
+                            .foregroundColor(.white)
+                            .font(.caption)
+                        
+                        Spacer().frame(width: 10)
+                        
+                        Text("(\(Int(model.processingProgress * 100))%)")
+                            .foregroundColor(.white)
+                            .font(.subheadline)
+                            .bold()
+                    }
+                    .padding(.top, 2)
+                    
+                    // Визуальный прогресс-бар
+                    ProgressView(value: model.processingProgress)
+                        .progressViewStyle(LinearProgressViewStyle(tint: .blue))
+                        .frame(width: 200)
+                        .padding(.top, 5)
+                    
+                    // Кнопка отмены обработки
+                    Button(action: {
+                        model.cancelProcessing()
+                    }) {
+                        Text("Отмена")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 8)
+                            .background(Capsule().fill(Color.red))
+                    }
+                    .padding(.top, 10)
+                }
+                .padding()
+                .background(
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(Color.black.opacity(0.7))
+                )
+                .padding()
+                .position(x: UIScreen.main.bounds.width / 2, y: 100)
+            }
+            
             // Легенда карты
             VStack {
                 Spacer()
-                
+                HStack {
+                    Button("Next") {
+                        Task {
+                            await model.next()
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    Button("All") {
+                        Task {
+                            await model.all()
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.isProcessing) // Блокируем кнопку во время обработки
+                }
                 HStack(spacing: 10) {
                     VStack(alignment: .leading, spacing: 5) {
                         HStack {
@@ -150,12 +216,6 @@ struct MapView: View {
                             .foregroundColor(.white)
                             .padding(.top, 2)
                     }
-                    Button("Next") {
-                        Task {
-                            await model.next()
-                        }
-                    }
-                    .buttonStyle(.borderedProminent)
                 }
                 .padding()
                 .background(Color.black.opacity(0.6))
@@ -183,6 +243,8 @@ struct MapViewRepresentable: UIViewRepresentable {
     @Binding var candidates: [TestCandidat]
     var model: MapModel
     var tracks: [Track]
+    // Отслеживаем изменения в дорожных сегментах, чтобы обновлять карту
+    @State private var lastRoadSegmentsCount: Int = 0
     
     func makeUIView(context: Context) -> MKMapView {
         let mapView = MKMapView()
@@ -202,6 +264,18 @@ struct MapViewRepresentable: UIViewRepresentable {
            mapView.overlays.filter({ $0 is TrackPolyline }).isEmpty {
             mapView.setRegion(region, animated: true)
         }
+        
+        // Проверяем, изменились ли roadSegments
+//        let currentSegmentsCount = model.roadSegments.count
+//        if currentSegmentsCount != lastRoadSegmentsCount {
+//            // Обновляем счетчик сегментов
+//            lastRoadSegmentsCount = currentSegmentsCount
+//            // Полное обновление оверлеев дорог для отображения новых сегментов
+//            let existingRoadOverlays = mapView.overlays.filter { $0 is RoadsOverlay }
+//            if !existingRoadOverlays.isEmpty {
+//                mapView.removeOverlays(existingRoadOverlays)
+//            }
+//        }
         
         // Обновляем треки
         updateTracks(mapView)
@@ -270,39 +344,41 @@ struct MapViewRepresentable: UIViewRepresentable {
     }
     
     private func updateRoadsOverlays(_ mapView: MKMapView) {
-        // Удаляем все предыдущие оверлеи дорог
+        // Проверяем, изменились ли дорожные сегменты с момента последнего обновления
+        let roadsNeedUpdate = !model.roadSegments.isEmpty
+        
+        // Удаляем все предыдущие оверлеи дорог если нужно обновление
         let existingRoadOverlays = mapView.overlays.filter { $0 is RoadsOverlay }
-        guard existingRoadOverlays.isEmpty else { return }
-        if !existingRoadOverlays.isEmpty {
-            return
-            print("Удаляем \(existingRoadOverlays.count) существующих оверлеев дорог")
+        if roadsNeedUpdate && !existingRoadOverlays.isEmpty {
             mapView.removeOverlays(existingRoadOverlays)
-        } else {
+        } else if !existingRoadOverlays.isEmpty && !roadsNeedUpdate {
+            // Если оверлеи уже есть и обновление не требуется, выходим
+            return
+        }
+        
+        // Добавляем новый оверлей дорог в зависимости от showAllRoads
+        if showAllRoads, let overlay = model.roadsOverlay {
+            print("Добавляем оверлей всех дорог: \((overlay as! RoadsOverlay).roads.count) дорог")
             
-            // Добавляем новый оверлей дорог в зависимости от showAllRoads
-            if showAllRoads, let overlay = model.roadsOverlay {
-                print("Добавляем оверлей всех дорог: \((overlay as! RoadsOverlay).roads.count) дорог")
-                
-                // Добавляем оверлей в начало списка, чтобы он был под треками
-                mapView.insertOverlay(overlay, at: 0)
-                
-                // Заставляем карту перерисоваться
-                mapView.setNeedsDisplay()
-                
-                print("Текущие оверлеи на карте после добавления: \(mapView.overlays.count)")
-            } else if let overlay = model.usedRoadsOverlay {
-                print("Добавляем оверлей используемых дорог: \((overlay as! RoadsOverlay).roads.filter { $0.isUsedByTrack }.count) дорог")
-                
-                // Добавляем оверлей в начало списка, чтобы он был под треками
-                mapView.insertOverlay(overlay, at: 0)
-                
-                // Заставляем карту перерисоваться
-                mapView.setNeedsDisplay()
-                
-                print("Текущие оверлеи на карте после добавления: \(mapView.overlays.count)")
-            } else {
-                print("ПРЕДУПРЕЖДЕНИЕ: Нет доступных оверлеев дорог для отображения")
-            }
+            // Добавляем оверлей в начало списка, чтобы он был под треками
+            mapView.insertOverlay(overlay, at: 0)
+            
+            // Заставляем карту перерисоваться
+            mapView.setNeedsDisplay()
+            
+            print("Текущие оверлеи на карте после добавления: \(mapView.overlays.count)")
+        } else if let overlay = model.usedRoadsOverlay {
+            print("Добавляем оверлей используемых дорог: \((overlay as! RoadsOverlay).roads.filter { $0.isUsedByTrack }.count) дорог")
+            
+            // Добавляем оверлей в начало списка, чтобы он был под треками
+            mapView.insertOverlay(overlay, at: 0)
+            
+            // Заставляем карту перерисоваться
+            mapView.setNeedsDisplay()
+            
+            print("Текущие оверлеи на карте после добавления: \(mapView.overlays.count)")
+        } else {
+            print("ПРЕДУПРЕЖДЕНИЕ: Нет доступных оверлеев дорог для отображения")
         }
     }
     
@@ -344,6 +420,7 @@ struct MapViewRepresentable: UIViewRepresentable {
                     renderer.lineDashPattern = [2, 2]
                 case .roadSegment:
                     renderer.lineWidth = 3
+                    renderer.strokeColor = .random()
                 }
                 return renderer
             } else {

@@ -42,6 +42,8 @@ class RoadsOverlay: NSObject, MKOverlay {
     var boundingMapRect: MKMapRect
     var coordinate: CLLocationCoordinate2D
     var isUsedRoadsOnly: Bool
+    // Кэш boundingRect для каждой дороги для оптимизации отображения
+    private var roadBoundingRects: [Int: MKMapRect] = [:]
     
     init(roads: [Road], isUsedRoadsOnly: Bool = false) {
         self.roads = roads
@@ -53,18 +55,37 @@ class RoadsOverlay: NSObject, MKOverlay {
         var maxX = -Double.infinity
         var maxY = -Double.infinity
         
-        for road in roads {
+        // Предварительно рассчитываем boundingRect для каждой дороги
+        for (index, road) in roads.enumerated() {
             // Пропускаем дороги, не используемые треком, если указан флаг isUsedRoadsOnly
             if isUsedRoadsOnly && !road.isUsedByTrack {
                 continue
             }
             
-            for coordinate in road.coordinates {
-                let point = MKMapPoint(coordinate)
-                minX = min(minX, point.x)
-                minY = min(minY, point.y)
-                maxX = max(maxX, point.x)
-                maxY = max(maxY, point.y)
+            if road.coordinates.count >= 2 {
+                var roadMinX = Double.infinity
+                var roadMinY = Double.infinity
+                var roadMaxX = -Double.infinity
+                var roadMaxY = -Double.infinity
+                
+                for coordinate in road.coordinates {
+                    let point = MKMapPoint(coordinate)
+                    roadMinX = min(roadMinX, point.x)
+                    roadMinY = min(roadMinY, point.y)
+                    roadMaxX = max(roadMaxX, point.x)
+                    roadMaxY = max(roadMaxY, point.y)
+                    
+                    // Также обновляем общие границы
+                    minX = min(minX, point.x)
+                    minY = min(minY, point.y)
+                    maxX = max(maxX, point.x)
+                    maxY = max(maxY, point.y)
+                }
+                
+                // Сохраняем boundingRect для этой дороги в кэше
+                let width = roadMaxX - roadMinX
+                let height = roadMaxY - roadMinY
+                roadBoundingRects[index] = MKMapRect(x: roadMinX, y: roadMinY, width: width, height: height)
             }
         }
         
@@ -87,12 +108,19 @@ class RoadsOverlay: NSObject, MKOverlay {
         
         super.init()
     }
+    
+    // Метод для получения boundingRect для дороги
+    func getBoundingRect(forRoadAt index: Int) -> MKMapRect? {
+        return roadBoundingRects[index]
+    }
 }
 
 // Класс для рендеринга оверлея дорог
 class RoadsOverlayRenderer: MKOverlayRenderer {
     var roads: [Road]
     var isUsedRoadsOnly: Bool
+    // Добавляем опциональный массив сегментов дорог для отображения
+    var roadSegments: [RoadSegment]?
     
     init(overlay: RoadsOverlay) {
         self.roads = overlay.roads
@@ -113,11 +141,27 @@ class RoadsOverlayRenderer: MKOverlayRenderer {
         print("Видимая область карты: \(mapRect)")
         print("Масштаб: \(zoomScale), линия: \(lineWidth)")
         
+        // Создаем расширенный прямоугольник с небольшим буфером вокруг видимой области
+        // Это предотвратит внезапное появление/исчезновение дорог на границах экрана
+        let bufferFactor: Double = 0.2 // 20% буфер
+        let bufferWidth = mapRect.size.width * bufferFactor
+        let bufferHeight = mapRect.size.height * bufferFactor
+        let visibleMapRectWithBuffer = MKMapRect(
+            x: mapRect.origin.x - bufferWidth / 2,
+            y: mapRect.origin.y - bufferHeight / 2,
+            width: mapRect.size.width + bufferWidth,
+            height: mapRect.size.height + bufferHeight
+        )
+        
         var drawnRoads = 0
         var skippedRoads = 0
+        var notVisibleRoads = 0
         
-        // Рисуем все дороги, фильтруя их по isUsedByTrack если нужно
-        for road in roads {
+        // Получаем ссылку на оверлей для доступа к предварительно рассчитанным boundingRect
+        let roadsOverlay = overlay as! RoadsOverlay
+        
+        // Рисуем только дороги, которые находятся в видимой области карты с буфером
+        for (index, road) in roads.enumerated() {
             // Пропускаем дороги, не используемые треком, если указан флаг isUsedRoadsOnly
             if isUsedRoadsOnly && !road.isUsedByTrack {
                 skippedRoads += 1
@@ -129,19 +173,32 @@ class RoadsOverlayRenderer: MKOverlayRenderer {
                 continue
             }
             
-            // Создаем boundingMapRect для дороги для логгирования
-            var roadMapRect = MKMapRect.null
-            for coordinate in road.coordinates {
-                let point = MKMapPoint(coordinate)
-                if roadMapRect.isNull {
-                    roadMapRect = MKMapRect(x: point.x, y: point.y, width: 0, height: 0)
-                } else {
-                    roadMapRect = roadMapRect.union(MKMapRect(x: point.x, y: point.y, width: 0, height: 0))
+            // Используем предварительно рассчитанный boundingRect из кэша
+            if let roadMapRect = roadsOverlay.getBoundingRect(forRoadAt: index) {
+                // Проверяем, пересекается ли дорога с видимой областью карты с буфером
+                // Если нет, пропускаем её отрисовку
+                if !visibleMapRectWithBuffer.intersects(roadMapRect) {
+                    notVisibleRoads += 1
+                    continue
+                }
+            } else {
+                // Для дорог без предварительно рассчитанного boundingRect, рассчитываем на лету
+                var roadMapRect = MKMapRect.null
+                for coordinate in road.coordinates {
+                    let point = MKMapPoint(coordinate)
+                    if roadMapRect.isNull {
+                        roadMapRect = MKMapRect(x: point.x, y: point.y, width: 0, height: 0)
+                    } else {
+                        roadMapRect = roadMapRect.union(MKMapRect(x: point.x, y: point.y, width: 0, height: 0))
+                    }
+                }
+                
+                // Проверяем, пересекается ли дорога с видимой областью карты с буфером
+                if !visibleMapRectWithBuffer.intersects(roadMapRect) {
+                    notVisibleRoads += 1
+                    continue
                 }
             }
-            
-            // Отрисовываем дорогу даже если она не пересекается с видимой областью карты
-            // Это позволит гарантированно отобразить все дороги, входящие в bbox трека
             
             // Задаем цвет и толщину в зависимости от того, используется ли дорога треком
             if road.isUsedByTrack {
@@ -159,15 +216,45 @@ class RoadsOverlayRenderer: MKOverlayRenderer {
             
             // Преобразуем координаты в точки на экране
             var firstPoint = true
-            for coordinate in road.coordinates {
-                let point = self.point(for: MKMapPoint(coordinate))
+            var previousCoordinate: CLLocationCoordinate2D? = nil
+            
+            // Оптимизация: разбиваем дорогу на сегменты и рисуем только те, которые видны
+            for i in 0..<(road.coordinates.count) {
+                let coordinate = road.coordinates[i]
                 
-                if firstPoint {
+                // Проверяем, находится ли текущая точка внутри видимой области
+                let mapPoint = MKMapPoint(coordinate)
+                let isCurrentPointVisible = visibleMapRectWithBuffer.contains(mapPoint)
+                
+                // Проверяем, находится ли предыдущая точка внутри видимой области
+                var isPreviousPointVisible = false
+                if let prevCoord = previousCoordinate {
+                    let prevMapPoint = MKMapPoint(prevCoord)
+                    isPreviousPointVisible = visibleMapRectWithBuffer.contains(prevMapPoint)
+                }
+                
+                // Рисуем сегмент, если хотя бы одна из точек видима или если 
+                // сегмент пересекает видимую область
+                if isCurrentPointVisible || isPreviousPointVisible || (previousCoordinate != nil && 
+                    segmentIntersectsRect(start: previousCoordinate!, end: coordinate, rect: visibleMapRectWithBuffer)) {
+                    
+                    let point = self.point(for: mapPoint)
+                    
+                    if firstPoint || previousCoordinate == nil {
+                        ctx.move(to: point)
+                        firstPoint = false
+                    } else {
+                        ctx.addLine(to: point)
+                    }
+                } else if firstPoint && i > 0 {
+                    // Если текущая точка не видна и это начало пути,
+                    // перемещаемся к ней, но не рисуем линию
+                    let point = self.point(for: mapPoint)
                     ctx.move(to: point)
                     firstPoint = false
-                } else {
-                    ctx.addLine(to: point)
                 }
+                
+                previousCoordinate = coordinate
             }
             
             // Рисуем путь
@@ -175,7 +262,50 @@ class RoadsOverlayRenderer: MKOverlayRenderer {
             drawnRoads += 1
         }
         
-        print("Фактически нарисовано дорог: \(drawnRoads), пропущено: \(skippedRoads)")
+        // Теперь рисуем RoadSegment с фиолетовым цветом
+        if let segments = roadSegments {
+            // Настройки для отрисовки сегментов
+           
+            ctx.setLineWidth(lineWidth * 5) // Немного толще обычных дорог для выделения
+            
+            var drawnSegments = 0
+            var skippedSegments = 0
+            
+            // Отрисовываем каждый сегмент
+            for segment in segments {
+                // Проверяем, находится ли сегмент в видимой области
+                ctx.setStrokeColor(UIColor.random().withAlphaComponent(0.8).cgColor)
+                let startPoint = MKMapPoint(segment.start)
+                let endPoint = MKMapPoint(segment.end)
+                
+                let isStartVisible = visibleMapRectWithBuffer.contains(startPoint)
+                let isEndVisible = visibleMapRectWithBuffer.contains(endPoint)
+                
+                // Если хотя бы одна из точек сегмента видима или сегмент пересекает видимую область
+                if isStartVisible || isEndVisible || 
+                   segmentIntersectsRect(start: segment.start, end: segment.end, rect: visibleMapRectWithBuffer) {
+                    
+                    ctx.beginPath()
+                    
+                    // Преобразуем координаты в точки экрана
+                    let startScreenPoint = self.point(for: startPoint)
+                    let endScreenPoint = self.point(for: endPoint)
+                    
+                    // Рисуем линию
+                    ctx.move(to: startScreenPoint)
+                    ctx.addLine(to: endScreenPoint)
+                    ctx.strokePath()
+                    
+                    drawnSegments += 1
+                } else {
+                    skippedSegments += 1
+                }
+            }
+            
+            print("Отрисовано \(drawnSegments) сегментов дорог, пропущено \(skippedSegments) сегментов")
+        }
+        
+        print("Фактически нарисовано дорог: \(drawnRoads), пропущено: \(skippedRoads), за пределами видимости: \(notVisibleRoads)")
     }
 }
 
@@ -199,4 +329,68 @@ func MKRoadWidthAtZoomScale(_ zoomScale: MKZoomScale) -> CGFloat {
         // Очень дальнее приближение - максимальная толщина для видимости
         return baseWidth * 3.0
     }
+}
+
+// Вспомогательная функция для проверки пересечения сегмента с прямоугольником
+func segmentIntersectsRect(start: CLLocationCoordinate2D, end: CLLocationCoordinate2D, rect: MKMapRect) -> Bool {
+    let startPoint = MKMapPoint(start)
+    let endPoint = MKMapPoint(end)
+    
+    // Проверяем пересечение сегмента с каждой из сторон прямоугольника
+    // Верхняя граница
+    if lineSegmentIntersection(ax: startPoint.x, ay: startPoint.y, bx: endPoint.x, by: endPoint.y,
+                              cx: rect.minX, cy: rect.minY, dx: rect.maxX, dy: rect.minY) {
+        return true
+    }
+    
+    // Правая граница
+    if lineSegmentIntersection(ax: startPoint.x, ay: startPoint.y, bx: endPoint.x, by: endPoint.y,
+                              cx: rect.maxX, cy: rect.minY, dx: rect.maxX, dy: rect.maxY) {
+        return true
+    }
+    
+    // Нижняя граница
+    if lineSegmentIntersection(ax: startPoint.x, ay: startPoint.y, bx: endPoint.x, by: endPoint.y,
+                              cx: rect.minX, cy: rect.maxY, dx: rect.maxX, dy: rect.maxY) {
+        return true
+    }
+    
+    // Левая граница
+    if lineSegmentIntersection(ax: startPoint.x, ay: startPoint.y, bx: endPoint.x, by: endPoint.y,
+                              cx: rect.minX, cy: rect.minY, dx: rect.minX, dy: rect.maxY) {
+        return true
+    }
+    
+    return false
+}
+
+// Проверка пересечения двух отрезков
+func lineSegmentIntersection(ax: Double, ay: Double, bx: Double, by: Double,
+                            cx: Double, cy: Double, dx: Double, dy: Double) -> Bool {
+    // Уравнение первого отрезка: P = A + t(B-A), где t ∈ [0,1]
+    // Уравнение второго отрезка: Q = C + s(D-C), где s ∈ [0,1]
+    // Пересечение есть, если найдутся такие t и s, что P = Q
+    
+    let abx = bx - ax
+    let aby = by - ay
+    let cdx = dx - cx
+    let cdy = dy - cy
+    
+    // Определитель для проверки параллельности отрезков
+    let det = abx * cdy - aby * cdx
+    
+    // Отрезки параллельны, пересечения нет
+    if abs(det) < 1e-9 {
+        return false
+    }
+    
+    let acx = cx - ax
+    let acy = cy - ay
+    
+    // Параметры пересечения
+    let t = (acx * cdy - acy * cdx) / det
+    let s = (acx * aby - acy * abx) / det
+    
+    // Пересечение есть, если оба параметра находятся в диапазоне [0,1]
+    return (t >= 0 && t <= 1 && s >= 0 && s <= 1)
 } 

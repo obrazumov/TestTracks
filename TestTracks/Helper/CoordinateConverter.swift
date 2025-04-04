@@ -20,6 +20,8 @@ struct RoadSegment: Hashable {
     // Информация о направлении дороги
     let isOneway: Bool
     let forwardDirection: Bool  // true если направление от start к end является разрешенным
+    // Идентификатор дороги, сегменты из разных дорог не должны соединяться
+    let roadId: String
     var direction: Double {
             let deltaX = end.longitude - start.longitude
             let deltaY = end.latitude - start.latitude
@@ -28,11 +30,12 @@ struct RoadSegment: Hashable {
     
     // Инициализатор с дефолтными значениями для обратной совместимости
     init(start: CLLocationCoordinate2D, end: CLLocationCoordinate2D, 
-         isOneway: Bool = true, forwardDirection: Bool = true) {
+         isOneway: Bool = true, forwardDirection: Bool = true, roadId: String = UUID().uuidString) {
         self.start = start
         self.end = end
         self.isOneway = isOneway
         self.forwardDirection = forwardDirection
+        self.roadId = roadId
     }
 }
 
@@ -46,12 +49,15 @@ class CoordinateConverter {
         }
         
         var segments: [RoadSegment] = []
+        // Создаем уникальный id для этой дороги
+        let roadId = UUID().uuidString
         
         // Проходим по массиву координат и создаем сегменты
         for i in 0..<coordinates.count - 1 {
             let segment = RoadSegment(
                 start: coordinates[i],
-                end: coordinates[i + 1]
+                end: coordinates[i + 1],
+                roadId: roadId
             )
             segments.append(segment)
         }
@@ -65,6 +71,8 @@ class CoordinateConverter {
         guard coordinates.count >= 2 else { return [] }
         
         var segments: [RoadSegment] = []
+        // Создаем уникальный id для этой дороги
+        let roadId = UUID().uuidString
         
         for i in 0..<coordinates.count - 1 {
             let startLocation = CLLocation(latitude: coordinates[i].latitude, 
@@ -78,7 +86,8 @@ class CoordinateConverter {
             if distance >= minSegmentLength {
                 let segment = RoadSegment(
                     start: coordinates[i],
-                    end: coordinates[i + 1]
+                    end: coordinates[i + 1],
+                    roadId: roadId
                 )
                 segments.append(segment)
             }
@@ -181,6 +190,9 @@ class CoordinateConverter {
         let isOneway = extractOnewayStatus(from: properties)
         let forwardDirection = extractDirection(from: properties)
         
+        // Создаем уникальный идентификатор для этой дороги
+        let roadId = UUID().uuidString
+        
         var roadSegments: [RoadSegment] = []
         
         // Создаем сегменты из координат
@@ -202,7 +214,8 @@ class CoordinateConverter {
                 start: startCoord,
                 end: endCoord,
                 isOneway: isOneway,
-                forwardDirection: forwardDirection
+                forwardDirection: forwardDirection,
+                roadId: roadId
             )
             
             roadSegments.append(segment)
@@ -259,7 +272,7 @@ class CoordinateConverter {
     
     // Загрузка дорожных сегментов из GeoJSON файла
     func loadRoadSegmentsFromGeoJSON(fileURL: URL) -> [RoadSegment] {
-        var roadSegments: [RoadSegment] = []
+        var allRoadSegments: [RoadSegment] = []
         
         do {
             let data = try Data(contentsOf: fileURL)
@@ -270,16 +283,20 @@ class CoordinateConverter {
             }
             
             for feature in features {
+                // Каждый feature - это отдельная дорога, создаем для нее отдельные сегменты
                 let segments = convertFromGeoJSON(feature: feature)
-                roadSegments.append(contentsOf: segments)
+                if !segments.isEmpty {
+                    // Добавляем сегменты этой дороги в общий массив
+                    allRoadSegments.append(contentsOf: segments)
+                }
             }
             
-            print("Загружено \(roadSegments.count) дорожных сегментов из GeoJSON")
+            print("Загружено \(allRoadSegments.count) дорожных сегментов из GeoJSON")
         } catch {
             print("Ошибка чтения GeoJSON файла: \(error.localizedDescription)")
         }
         
-        return roadSegments
+        return allRoadSegments
     }
 }
 

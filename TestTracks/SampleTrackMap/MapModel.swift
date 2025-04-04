@@ -32,11 +32,14 @@ final class MapModel: ObservableObject {
     @Published var candidates: [TestCandidat] = []
     @Published var isLoading: Bool = false
     @Published var loadingProgress: String = "Начало загрузки..."
+    @Published var processingProgress: Float = 0.0 // Прогресс обработки (0.0 - 1.0)
+    @Published var isProcessing: Bool = false // Флаг, указывающий на выполнение длительной операции
+    @Published var trackPointCount: Int = 0 // Количество точек в треке
     @Published var position: MapCameraPosition = .region(MKCoordinateRegion(
         center: CLLocationCoordinate2D(latitude: 0, longitude: 0),
         span: MKCoordinateSpan(latitudeDelta: 0.1, longitudeDelta: 0.1)
     ))
-    private var roadSegments: [RoadSegment] = []
+    var roadSegments: [RoadSegment] = []
     // Расстояние для определения близости дороги к треку (в метрах)
     private let proximityDistance: Double = 200.0 // Увеличено с 100 до 200 метров
     // Шаг для проверки точек трека (проверяем каждую n-ю точку)
@@ -44,6 +47,8 @@ final class MapModel: ObservableObject {
     private var trackPoints: [TrackPoint] = []
     private var originalTrack: Track? = nil
     private var currentIndex = 0
+    // Флаг для отмены операции обработки
+    private var isCancelled = false
     func loadTracks() async {
         // Устанавливаем флаг загрузки
         await MainActor.run {
@@ -60,17 +65,96 @@ final class MapModel: ObservableObject {
         await updateProgress("Загрузка завершена")
         await MainActor.run {
             self.isLoading = false
+            // Обновляем счетчик точек
+            self.trackPointCount = trackPoints.count
         }
     }
     func next() async {
-        guard currentIndex < trackPoints.count - 1 else { return }
-        currentIndex += 1
-        guard let candidate = await mapMatcher.matchTrackCandidat(gpsTrack: trackPoints, roadSegments: roadSegments, index: currentIndex) else { return }
+        guard currentIndex < trackPoints.count && !roadSegments.isEmpty else { return }
+        
+        // Отмечаем начало обработки одной точки
         await MainActor.run {
-            candidates.append(candidate)
+            self.isProcessing = true
+            self.processingProgress = 0.5 // Устанавливаем 50% для одиночной операции
+        }
+        
+        if let candidate = await mapMatcher.matchTrackCandidat(gpsTrack: trackPoints, roadSegments: roadSegments, index: currentIndex) {
+            currentIndex += 1
+            await MainActor.run {
+                self.candidates = [candidate]
+                self.processingProgress = 1.0
+                // Небольшая задержка перед скрытием индикатора для лучшего UX
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    self.isProcessing = false
+                }
+            }
+        } else {
+            await MainActor.run {
+                self.isProcessing = false
+            }
+        }
+        
+        currentIndex += 1
+        if currentIndex >= trackPoints.count {
+            currentIndex = 0
         }
     }
-    
+    func all() async {
+        guard !trackPoints.isEmpty && !roadSegments.isEmpty else { return }
+        
+        // Отмечаем начало обработки и сбрасываем флаг отмены
+        isCancelled = false
+        await MainActor.run {
+            self.isProcessing = true
+            self.processingProgress = 0.0
+        }
+        
+        var newCandidates: [TestCandidat] = []
+        let totalPoints = trackPoints.count
+        
+        for i in trackPoints.indices {
+            // Проверяем флаг отмены перед каждой итерацией
+            if isCancelled {
+                await MainActor.run {
+                    self.isProcessing = false
+                }
+                return
+            }
+            
+            guard let candidate = await mapMatcher.matchTrackCandidat(gpsTrack: trackPoints, roadSegments: roadSegments, index: i) else { 
+                // Прекращаем обработку при ошибке
+                await MainActor.run {
+                    self.isProcessing = false
+                }
+                return 
+            }
+            
+            newCandidates.append(candidate)
+            currentIndex = i
+            
+            // Обновляем прогресс каждые 5 точек или когда обработка завершена
+            if i % 5 == 0 || i == totalPoints - 1 {
+                let progress = Float(i + 1) / Float(totalPoints)
+                await MainActor.run {
+                    self.processingProgress = progress
+                }
+            }
+        }
+        
+        // Проверяем флаг отмены перед обновлением результата
+        if !isCancelled {
+            let finalCandidates = newCandidates
+            await MainActor.run {
+                self.candidates = finalCandidates
+                self.isProcessing = false  // Завершаем обработку
+                self.processingProgress = 1.0  // Устанавливаем полный прогресс
+            }
+        }
+    }
+    // Метод для отмены текущей операции обработки
+    func cancelProcessing() {
+        isCancelled = true
+    }
 }
 
 private extension MapModel {
@@ -108,6 +192,20 @@ private extension MapModel {
             }
         }
         return trackCoordinates
+    }
+    func loadRoadSegment() async -> [RoadSegment] {
+        if let filePath = Bundle.main.path(forResource: TrackType.road.fileName, ofType: nil) {
+            let fileURL = URL(fileURLWithPath: filePath)
+            if fileURL.pathExtension.lowercased() == "geojson" {
+                // Проверяем, есть ли трек, без которого невозможно определить bbox
+                let roadsSegment = coordinateConverter.loadRoadSegmentsFromGeoJSON(fileURL: fileURL)
+                return roadsSegment
+            } else {
+                return []
+            }
+        } else {
+            return []
+        }
     }
     func loadRoads(trackCoordinates: [CLLocationCoordinate2D]) async {
         await updateProgress("Загрузка дорог из GeoJSON...")
@@ -236,7 +334,7 @@ private extension MapModel {
                 
                 // Извлекаем координаты для маппинга
                 let roadCoordinates = self.extractCoordinatesForMapMatching(roads: finalRoadsForMapping)
-                self.roadSegments = coordinateConverter.convertToRoadSegments(coordinates: roadCoordinates)
+                self.roadSegments = await loadRoadSegment()
                 print("Извлечено \(roadCoordinates.count) координат для маппинга")
                 
                 if !roadCoordinates.isEmpty {
