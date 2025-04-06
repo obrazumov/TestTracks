@@ -39,7 +39,7 @@ final class MapModel: ObservableObject {
         center: CLLocationCoordinate2D(latitude: 0, longitude: 0),
         span: MKCoordinateSpan(latitudeDelta: 0.1, longitudeDelta: 0.1)
     ))
-    var roadSegments: [RoadSegment] = []
+    var roadSegmentsForDisplay: [RoadSegment] = []
     // Расстояние для определения близости дороги к треку (в метрах)
     private let proximityDistance: Double = 200.0 // Увеличено с 100 до 200 метров
     // Шаг для проверки точек трека (проверяем каждую n-ю точку)
@@ -49,6 +49,8 @@ final class MapModel: ObservableObject {
     private var currentIndex = 0
     // Флаг для отмены операции обработки
     private var isCancelled = false
+    private var originalRoadSegments: [RoadSegment] = [] // Для хранения оригинальных сегментов
+    
     func loadTracks() async {
         // Устанавливаем флаг загрузки
         await MainActor.run {
@@ -70,7 +72,7 @@ final class MapModel: ObservableObject {
         }
     }
     func next() async {
-        guard currentIndex < trackPoints.count && !roadSegments.isEmpty else { return }
+        guard currentIndex < trackPoints.count && !originalRoadSegments.isEmpty else { return }
         
         // Отмечаем начало обработки одной точки
         await MainActor.run {
@@ -78,8 +80,15 @@ final class MapModel: ObservableObject {
             self.processingProgress = 0.5 // Устанавливаем 50% для одиночной операции
         }
         
-        if let candidate = await mapMatcher.matchTrackCandidat(gpsTrack: trackPoints, roadSegments: roadSegments, index: currentIndex) {
-            currentIndex += 1
+        // Получаем bbox для текущей точки трека и фильтруем roadSegments
+        let bbox = self.getTrackBoundingBox([trackPoints[currentIndex].coordinate], expandBy: 0.01).expanded
+        
+        // Используем общий метод фильтрации
+        let filteredRoadSegments = filterRoadSegmentsByBBox(segments: originalRoadSegments, bbox: bbox)
+        
+        print("Для точки \(currentIndex) отфильтровано \(filteredRoadSegments.count) из \(originalRoadSegments.count) сегментов дорог")
+        
+        if let candidate = await mapMatcher.matchTrackCandidat(gpsTrack: trackPoints, roadSegments: filteredRoadSegments, index: currentIndex) {
             await MainActor.run {
                 self.candidates = [candidate]
                 self.processingProgress = 1.0
@@ -100,7 +109,7 @@ final class MapModel: ObservableObject {
         }
     }
     func all() async {
-        guard !trackPoints.isEmpty && !roadSegments.isEmpty else { return }
+        guard !trackPoints.isEmpty && !originalRoadSegments.isEmpty else { return }
         
         // Отмечаем начало обработки и сбрасываем флаг отмены
         isCancelled = false
@@ -109,11 +118,25 @@ final class MapModel: ObservableObject {
             self.processingProgress = 0.0
         }
         
-        var newCandidates: [TestCandidat] = []
+        // Получаем bbox для trackpoints
+        let bbox = self.getTrackBoundingBox(trackPoints.map { $0.coordinate }, expandBy: 0.01).expanded
+        
+        // Фильтруем roadSegments по bbox используя наш новый метод
+        let filteredRoadSegments = filterRoadSegmentsByBBox(segments: originalRoadSegments, bbox: bbox)
+        
+        print("Отфильтровано \(filteredRoadSegments.count) из \(originalRoadSegments.count) сегментов дорог в пределах bbox")
+        
         let totalPoints = trackPoints.count
         
-        for i in trackPoints.indices {
-            // Проверяем флаг отмены перед каждой итерацией
+        // Используем TaskGroup для параллельной обработки
+        var allCandidates = [Int: TestCandidat]() // Для сохранения порядка
+        
+        // Разбиваем на группы для обработки
+        let batchSize = 5 // Размер пакета для обработки
+        let numBatches = (totalPoints + batchSize - 1) / batchSize // Округление вверх
+        
+        for batchIndex in 0..<numBatches {
+            // Проверяем флаг отмены перед каждой партией
             if isCancelled {
                 await MainActor.run {
                     self.isProcessing = false
@@ -121,39 +144,97 @@ final class MapModel: ObservableObject {
                 return
             }
             
-            guard let candidate = await mapMatcher.matchTrackCandidat(gpsTrack: trackPoints, roadSegments: roadSegments, index: i) else { 
-                // Прекращаем обработку при ошибке
+            // Вычисляем диапазон индексов для текущей партии
+            let startIdx = batchIndex * batchSize
+            let endIdx = min(startIdx + batchSize, totalPoints)
+            
+            // Создаем TaskGroup для параллельной обработки внутри партии
+            var batchResults = [Int: TestCandidat]()
+            
+            try? await withThrowingTaskGroup(of: (Int, TestCandidat?).self) { group in
+                // Добавляем задачи в группу
+                for i in startIdx..<endIdx {
+                    group.addTask {
+                        // Проверка на отмену внутри задачи
+                        if self.isCancelled {
+                            return (i, nil)
+                        }
+                        let candidate = await self.mapMatcher.matchTrackCandidat(
+                            gpsTrack: self.trackPoints, 
+                            roadSegments: filteredRoadSegments, 
+                            index: i
+                        )
+                        return (i, candidate)
+                    }
+                }
+                
+                // Собираем результаты
+                for try await (index, candidate) in group {
+                    if let candidate = candidate {
+                        batchResults[index] = candidate
+                    }
+                }
+            }
+            
+            // Если операция отменена, выходим
+            if isCancelled {
                 await MainActor.run {
                     self.isProcessing = false
                 }
-                return 
+                return
             }
             
-            newCandidates.append(candidate)
-            currentIndex = i
+            // Добавляем результаты партии в общий массив
+            for (index, candidate) in batchResults {
+                allCandidates[index] = candidate
+            }
             
-            // Обновляем прогресс каждые 5 точек или когда обработка завершена
-            if i % 5 == 0 || i == totalPoints - 1 {
-                let progress = Float(i + 1) / Float(totalPoints)
-                await MainActor.run {
-                    self.processingProgress = progress
-                }
+            // Обновляем прогресс после каждой партии
+            let currentProgress = Float(endIdx) / Float(totalPoints)
+            await MainActor.run {
+                self.processingProgress = currentProgress
+                currentIndex = endIdx - 1
             }
         }
         
-        // Проверяем флаг отмены перед обновлением результата
+        // Подготавливаем финальный массив в правильном порядке
         if !isCancelled {
-            let finalCandidates = newCandidates
+            let finalCandidates = (0..<totalPoints).compactMap { allCandidates[$0] }
+            
             await MainActor.run {
                 self.candidates = finalCandidates
-                self.isProcessing = false  // Завершаем обработку
-                self.processingProgress = 1.0  // Устанавливаем полный прогресс
+                self.isProcessing = false
+                self.processingProgress = 1.0
             }
         }
     }
     // Метод для отмены текущей операции обработки
     func cancelProcessing() {
         isCancelled = true
+    }
+    // Метод для визуализации отфильтрованных дорожных сегментов
+    func visualizeFilteredRoadSegments() {
+        guard !trackPoints.isEmpty && !originalRoadSegments.isEmpty else { return }
+        
+        // Получаем bbox для всех trackpoints
+        let bbox = self.getTrackBoundingBox(trackPoints.map { $0.coordinate }, expandBy: 0.01).expanded
+        
+        // Фильтруем roadSegments по bbox используя наш новый метод
+        let filteredRoadSegments = filterRoadSegmentsByBBox(segments: originalRoadSegments, bbox: bbox)
+        
+        print("Для визуализации отфильтровано \(filteredRoadSegments.count) из \(originalRoadSegments.count) сегментов дорог в пределах bbox")
+        
+        // Обновляем модель для отображения только отфильтрованных сегментов
+        Task { @MainActor in
+            // Устанавливаем отфильтрованные сегменты для отображения
+            self.roadSegmentsForDisplay = filteredRoadSegments
+            
+            // Уведомляем об изменении для обновления отображения
+            self.objectWillChange.send()
+        }
+    }
+    func resetRoadSegments() {
+        self.roadSegmentsForDisplay = []
     }
 }
 
@@ -194,16 +275,25 @@ private extension MapModel {
         return trackCoordinates
     }
     func loadRoadSegment() async -> [RoadSegment] {
+        await updateProgress("Загрузка дорожных сегментов...")
+        
         if let filePath = Bundle.main.path(forResource: TrackType.road.fileName, ofType: nil) {
             let fileURL = URL(fileURLWithPath: filePath)
             if fileURL.pathExtension.lowercased() == "geojson" {
-                // Проверяем, есть ли трек, без которого невозможно определить bbox
-                let roadsSegment = coordinateConverter.loadRoadSegmentsFromGeoJSON(fileURL: fileURL)
-                return roadsSegment
+                let startTime = Date()
+                let roadSegments = coordinateConverter.loadRoadSegmentsFromGeoJSON(fileURL: fileURL)
+                let endTime = Date()
+                let loadTime = endTime.timeIntervalSince(startTime)
+                
+                await updateProgress("Загружено \(roadSegments.count) дорожных сегментов за \(String(format: "%.2f", loadTime)) сек")
+                
+                return roadSegments
             } else {
+                await updateProgress("Файл \(TrackType.road.fileName) не является GeoJSON файлом")
                 return []
             }
         } else {
+            await updateProgress("Не удалось найти файл \(TrackType.road.fileName)")
             return []
         }
     }
@@ -334,17 +424,17 @@ private extension MapModel {
                 
                 // Извлекаем координаты для маппинга
                 let roadCoordinates = self.extractCoordinatesForMapMatching(roads: finalRoadsForMapping)
-                self.roadSegments = await loadRoadSegment()
+                self.originalRoadSegments = await loadRoadSegment()
                 print("Извлечено \(roadCoordinates.count) координат для маппинга")
                 
                 if !roadCoordinates.isEmpty {
-                    print("Создано \(self.roadSegments.count) дорожных сегментов")
+                    print("Создано \(self.originalRoadSegments.count) дорожных сегментов")
                     
                     // Если у нас есть трек и дорожные сегменты, делаем map matching
-                    if !trackCoordinates.isEmpty && !self.roadSegments.isEmpty {
-                        await updateProgress("Сопоставление трека с дорогами (\(self.roadSegments.count) сегментов)...")
+                    if !trackCoordinates.isEmpty && !self.originalRoadSegments.isEmpty {
+                        await updateProgress("Сопоставление трека с дорогами (\(self.originalRoadSegments.count) сегментов)...")
                         // Создаем скорректированный трек
-                        let correctedCoordinates = self.mapMatcher.matchTrack(gpsTrack: self.trackPoints, roadSegments: self.roadSegments, maxDistance: 15, forceSnapToRoad: true, maxForceSnapDistance: 30, removeDuplicates: true, fillGaps: true, simplifyTrack: false)
+                        let correctedCoordinates = self.mapMatcher.matchTrack(gpsTrack: self.trackPoints, roadSegments: self.originalRoadSegments, maxDistance: 15, forceSnapToRoad: true, maxForceSnapDistance: 30, removeDuplicates: true, fillGaps: true, simplifyTrack: false)
                         
                         let correctedTrack = Track(
                             name: "\(fileURL.deletingPathExtension().lastPathComponent)_corrected",
@@ -663,5 +753,99 @@ private extension MapModel {
         
         print("Финальное количество координат: \(coordinates.count)")
         return coordinates
+    }
+    
+    // Метод для фильтрации roadSegments по bbox
+    func filterRoadSegmentsByBBox(segments: [RoadSegment], bbox: (minLat: Double, maxLat: Double, minLon: Double, maxLon: Double)) -> [RoadSegment] {
+        let filteredSegments = segments.filter { segment in
+            let startInBBox = segment.start.latitude >= bbox.minLat && 
+                               segment.start.latitude <= bbox.maxLat &&
+                               segment.start.longitude >= bbox.minLon &&
+                               segment.start.longitude <= bbox.maxLon
+            
+            let endInBBox = segment.end.latitude >= bbox.minLat && 
+                             segment.end.latitude <= bbox.maxLat &&
+                             segment.end.longitude >= bbox.minLon &&
+                             segment.end.longitude <= bbox.maxLon
+            
+            // Также проверяем пересечение сегмента с границами bbox
+            if !startInBBox && !endInBBox {
+                // Проверка пересечения с границами
+                return segmentIntersectsBBox(segment: segment, bbox: bbox)
+            }
+            
+            return startInBBox || endInBBox
+        }
+        
+        return filteredSegments
+    }
+    
+    // Проверка пересечения сегмента с bbox
+    func segmentIntersectsBBox(segment: RoadSegment, bbox: (minLat: Double, maxLat: Double, minLon: Double, maxLon: Double)) -> Bool {
+        // Создаем координаты углов bbox
+        let topLeft = CLLocationCoordinate2D(latitude: bbox.maxLat, longitude: bbox.minLon)
+        let topRight = CLLocationCoordinate2D(latitude: bbox.maxLat, longitude: bbox.maxLon)
+        let bottomLeft = CLLocationCoordinate2D(latitude: bbox.minLat, longitude: bbox.minLon)
+        let bottomRight = CLLocationCoordinate2D(latitude: bbox.minLat, longitude: bbox.maxLon)
+        
+        // Проверяем пересечение с каждой стороной bbox
+        // Верхняя граница
+        if segmentIntersectsLineSegment(a: segment.start, b: segment.end, c: topLeft, d: topRight) {
+            return true
+        }
+        
+        // Правая граница
+        if segmentIntersectsLineSegment(a: segment.start, b: segment.end, c: topRight, d: bottomRight) {
+            return true
+        }
+        
+        // Нижняя граница
+        if segmentIntersectsLineSegment(a: segment.start, b: segment.end, c: bottomLeft, d: bottomRight) {
+            return true
+        }
+        
+        // Левая граница
+        if segmentIntersectsLineSegment(a: segment.start, b: segment.end, c: topLeft, d: bottomLeft) {
+            return true
+        }
+        
+        return false
+    }
+    
+    // Проверка пересечения двух отрезков
+    func segmentIntersectsLineSegment(a: CLLocationCoordinate2D, b: CLLocationCoordinate2D, 
+                                     c: CLLocationCoordinate2D, d: CLLocationCoordinate2D) -> Bool {
+        // Вычисляем ориентации
+        func orientation(p: CLLocationCoordinate2D, q: CLLocationCoordinate2D, r: CLLocationCoordinate2D) -> Int {
+            let val = (q.longitude - p.longitude) * (r.latitude - q.latitude) - 
+                      (q.latitude - p.latitude) * (r.longitude - q.longitude)
+            
+            if abs(val) < 1e-9 { return 0 } // коллинеарны
+            return val > 0 ? 1 : 2 // по часовой или против часовой стрелки
+        }
+        
+        let o1 = orientation(p: a, q: b, r: c)
+        let o2 = orientation(p: a, q: b, r: d)
+        let o3 = orientation(p: c, q: d, r: a)
+        let o4 = orientation(p: c, q: d, r: b)
+        
+        // Общий случай пересечения
+        if o1 != o2 && o3 != o4 { return true }
+        
+        // Специальные случаи (коллинеарность)
+        if o1 == 0 && onSegment(p: a, q: c, r: b) { return true }
+        if o2 == 0 && onSegment(p: a, q: d, r: b) { return true }
+        if o3 == 0 && onSegment(p: c, q: a, r: d) { return true }
+        if o4 == 0 && onSegment(p: c, q: b, r: d) { return true }
+        
+        return false
+    }
+    
+    // Проверка, лежит ли точка q на отрезке pr
+    func onSegment(p: CLLocationCoordinate2D, q: CLLocationCoordinate2D, r: CLLocationCoordinate2D) -> Bool {
+        return q.longitude <= max(p.longitude, r.longitude) && 
+               q.longitude >= min(p.longitude, r.longitude) &&
+               q.latitude <= max(p.latitude, r.latitude) && 
+               q.latitude >= min(p.latitude, r.latitude)
     }
 }

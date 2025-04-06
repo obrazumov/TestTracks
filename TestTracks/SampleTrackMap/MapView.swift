@@ -160,12 +160,27 @@ struct MapView: View {
                         }
                     }
                     .buttonStyle(.borderedProminent)
+                    
                     Button("All") {
                         Task {
                             await model.all()
                         }
                     }
                     .buttonStyle(.borderedProminent)
+                    .disabled(model.isProcessing) // Блокируем кнопку во время обработки
+                    
+                    Button("Фильтр") {
+                        model.visualizeFilteredRoadSegments()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.purple) // Фиолетовый цвет для кнопки фильтрации
+                    .disabled(model.isProcessing) // Блокируем кнопку во время обработки
+                    
+                    Button("Сброс") {
+                        model.resetRoadSegments()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.orange) // Оранжевый цвет для кнопки сброса
                     .disabled(model.isProcessing) // Блокируем кнопку во время обработки
                 }
                 HStack(spacing: 10) {
@@ -202,6 +217,15 @@ struct MapView: View {
                                 .fill(Color.green)
                                 .frame(width: 30, height: 3)
                             Text("Скорректированный трек")
+                                .font(.caption)
+                                .foregroundColor(.white)
+                        }
+                        
+                        HStack {
+                            Rectangle()
+                                .fill(Color.purple)
+                                .frame(width: 30, height: 3)
+                            Text("Отфильтрованные сегменты")
                                 .font(.caption)
                                 .foregroundColor(.white)
                         }
@@ -345,7 +369,7 @@ struct MapViewRepresentable: UIViewRepresentable {
     
     private func updateRoadsOverlays(_ mapView: MKMapView) {
         // Проверяем, изменились ли дорожные сегменты с момента последнего обновления
-        let roadsNeedUpdate = !model.roadSegments.isEmpty
+        let roadsNeedUpdate = !model.roadSegmentsForDisplay.isEmpty
         
         // Удаляем все предыдущие оверлеи дорог если нужно обновление
         let existingRoadOverlays = mapView.overlays.filter { $0 is RoadsOverlay }
